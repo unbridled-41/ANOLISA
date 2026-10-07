@@ -78,6 +78,27 @@ impl SkillFs {
             }
         }
 
+        // A dot-prefixed top-level name is not a managed skill in any view:
+        // the store loaders skip hidden directories, so `mkdir /skills/.x`
+        // only inserted a placeholder that `/skills` and the `skill-discover`
+        // catalog advertised until the next scan, while leaving a stray
+        // directory behind. Refuse the shape like the inbox namespace does.
+        if let PathType::SkillDir { ref skill_name } = path_type {
+            if skill_name.starts_with('.') {
+                warn!(op = "mkdir", name = %skill_name, "hidden skill name rejected");
+                self.emit_op_event(
+                    req,
+                    &path_type,
+                    SkillEventKind::Create,
+                    SkillEventAction::Rejected,
+                    Some(libc::EACCES),
+                    None,
+                );
+                reply.error(libc::EACCES);
+                return;
+            }
+        }
+
         // The skill-discover namespace is always read-only — mirror the
         // write/open/setattr/symlink/link guards (write.rs) so `mkdir`
         // cannot create (or inject a store placeholder for) the reserved
@@ -841,6 +862,32 @@ impl SkillFs {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Renaming a skill *onto* a dot-prefixed name takes it out of the
+        // managed namespace: the loaders skip hidden directories, so the
+        // store entry was renamed to a name no listing ever surfaces again and
+        // the skill disappeared at the next mount. Only the target shape is
+        // checked; renaming a stray hidden directory *to* a valid skill name
+        // still adopts it.
+        if let PathType::SkillDir { ref skill_name } = new_path_type {
+            if skill_name.starts_with('.') {
+                warn!(op = "rename", name = %skill_name, "hidden skill rename target rejected");
+                self.emit_event(
+                    SkillEvent::new(SkillEventKind::Rename)
+                        .with_optional_skill_name(event_skill.clone())
+                        .with_optional_relative_path(event_relative.clone())
+                        .with_action(SkillEventAction::Rejected)
+                        .with_errno(libc::EACCES)
+                        .with_caller(req.uid(), req.gid())
+                        .with_detail(format!(
+                            "class=hidden_skill_name skill={} old={} new={}",
+                            skill_name, old_path, new_path
+                        )),
+                );
+                reply.error(libc::EACCES);
+                return;
             }
         }
 

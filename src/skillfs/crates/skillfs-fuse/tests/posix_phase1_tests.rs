@@ -1427,3 +1427,86 @@ fn test_raw_byte_source_root_metadata_and_statfs() {
     );
     assert!(st.f_bsize > 0, "statfs must report real filesystem stats");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dot-prefixed names at a flat skill slot stay out of the managed namespace.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wait until the fixture's mount answers at `skills`.
+fn wait_for_skills_root(skills: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::metadata(skills).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the mount did not become ready at {}",
+            skills.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// `mkdir /skills/.trash` used to succeed. It created `source/.trash` and
+/// inserted a store placeholder, so `/skills` and the `skill-discover` catalog
+/// advertised a "skill" that the loaders skip — the entry vanished at the next
+/// mount while the stray directory stayed in the source tree. The name shape
+/// is refused here like the inbox namespace refuses it.
+#[test]
+fn mkdir_of_a_dot_prefixed_skill_slot_is_refused() {
+    skip_if_no_fuse!();
+
+    let fix = MountFixture::normal(|dir| create_skill_dir(dir, "good"));
+    let skills = fix.skills_root();
+    wait_for_skills_root(&skills);
+    assert!(list_dir_names(&skills).contains(&"good".to_string()));
+
+    let err = std::fs::create_dir(skills.join(".trash"))
+        .expect_err("a dot-prefixed skill slot must be refused");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "expected EACCES for a hidden skill name, got {err:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(fix.source().join(".trash")).is_err(),
+        "a refused mkdir must not create source/.trash"
+    );
+    let listed = list_dir_names(&skills);
+    assert!(
+        !listed.contains(&".trash".to_string()),
+        "the refused name must not be listed as a skill, got {listed:?}"
+    );
+}
+
+/// `rename /skills/good /skills/.gone` used to succeed: the skill left every
+/// listing, its store entry was renamed to a name the loaders skip, and the
+/// skill was gone at the next mount. The target shape is refused.
+#[test]
+fn rename_of_a_skill_onto_a_dot_prefixed_name_is_refused() {
+    skip_if_no_fuse!();
+
+    let fix = MountFixture::normal(|dir| create_skill_dir(dir, "good"));
+    let skills = fix.skills_root();
+    wait_for_skills_root(&skills);
+    assert!(list_dir_names(&skills).contains(&"good".to_string()));
+
+    let err = std::fs::rename(skills.join("good"), skills.join(".gone"))
+        .expect_err("renaming a skill onto a hidden name must be refused");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "expected EACCES for a hidden rename target, got {err:?}"
+    );
+    assert!(
+        fix.source().join("good").is_dir(),
+        "the skill directory must stay where it was"
+    );
+    assert!(
+        std::fs::symlink_metadata(fix.source().join(".gone")).is_err(),
+        "a refused rename must not create source/.gone"
+    );
+    let listed = list_dir_names(&skills);
+    assert!(
+        listed.contains(&"good".to_string()) && !listed.contains(&".gone".to_string()),
+        "the skill list must be unchanged, got {listed:?}"
+    );
+}
