@@ -400,6 +400,26 @@ impl SkillFs {
             && matches!(self.resolve_skill_read(name), ReadResolution::Hidden)
     }
 
+    /// Whether a top-level Hermes entry is listed but cannot be resolved
+    /// through the mount, so a listing must not surface it.
+    ///
+    /// Only an in-place root readdir *is* the physical workspace, so only
+    /// in-place rewrites a non-directory top-level entry to the `HermesMeta`
+    /// passthrough label ([`crate::fs::SkillFs::parse_fuse_path`]). In a
+    /// normal mount the classifier leaves it a `CategoryDir`, whose lookup
+    /// answers `ENOENT` for a non-directory — so listing it handed `ls -l`,
+    /// `find` and `rsync` a name nothing can stat. Hermes management paths
+    /// keep their `HermesMeta` label in both modes and stay listed.
+    pub(super) fn hermes_root_file_is_unreachable(
+        &self,
+        name: &str,
+        physical: &std::path::Path,
+    ) -> bool {
+        !self.in_place
+            && !is_hermes_management_path(name)
+            && !std::fs::symlink_metadata(physical).is_ok_and(|metadata| metadata.is_dir())
+    }
+
     /// Hidden-write gate for a Hermes nested path (`category/skill/...`).
     ///
     /// Mirrors [`Self::should_reject_hidden_write`] but resolves through

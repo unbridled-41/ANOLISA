@@ -82,6 +82,15 @@ impl SkillFs {
                         if self.is_staging_skill_root(&name) {
                             continue;
                         }
+                        // A non-management top-level file has no resolvable
+                        // path type in a normal mount: the classifier keeps it
+                        // a `CategoryDir`, whose lookup answers ENOENT for a
+                        // non-directory, and the in-place file rewrite does not
+                        // apply here. Listing it gave `ls -l`, `find` and
+                        // `rsync` an entry nothing could stat.
+                        if self.hermes_root_file_is_unreachable(&name, &entry.path()) {
+                            continue;
+                        }
                         let kind = dir_entry_file_type(&entry);
                         let entry_path = self.skill_inode_path(&name);
                         let entry_ino = self.inodes.readdir_ino(&entry_path);
@@ -743,6 +752,12 @@ impl SkillFs {
                             // filters them; a snapshot taken at opendir must
                             // not leak them either).
                             if self.is_staging_skill_root(&name) {
+                                continue;
+                            }
+                            // Mirror the dynamic filter: a top-level file only
+                            // an in-place mount can resolve must not appear in
+                            // the snapshot either.
+                            if self.hermes_root_file_is_unreachable(&name, &entry.path()) {
                                 continue;
                             }
                             let kind = dir_entry_file_type(&entry);

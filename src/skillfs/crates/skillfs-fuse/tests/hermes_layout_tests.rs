@@ -1971,6 +1971,76 @@ fn hermes_top_level_file_is_listed_and_readable() {
 }
 
 // -----------------------------------------------------------------------
+// 18b-bis. Normal Hermes mount: no listed-but-unresolvable root entry.
+// -----------------------------------------------------------------------
+
+#[test]
+fn hermes_normal_root_listing_has_no_unreachable_entries() {
+    skip_if_no_fuse!();
+
+    let fix = MountFixture::normal_hermes(|dir| {
+        seed_hermes_workspace(dir);
+        // Plain files at the workspace root. The `/skills` listing of a
+        // normal Hermes mount reads the physical workspace, but the
+        // classifier only rewrites top-level files to a readable label in
+        // an in-place mount; here they stayed `CategoryDir`, whose lookup
+        // answers ENOENT for a non-directory. The listing therefore showed
+        // entries that `stat`, `cat`, `ls -l`, `find` and `rsync` all
+        // failed on.
+        std::fs::write(dir.join("README.md"), "top-level readme\n").unwrap();
+        std::fs::write(dir.join("LICENSE"), "license text\n").unwrap();
+    });
+
+    let skills = fix.mountpoint().join("skills");
+    // The fixture returns before the daemon is guaranteed to be serving
+    // (`mount_background_configured` reports success without waiting), so
+    // wait for the skills root to answer before asserting on its contents.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::metadata(&skills).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the mount did not become ready within the deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let entries = list_dir_names(&skills);
+    assert!(
+        !entries.contains(&"README.md".to_string()),
+        "a top-level file no mount path can resolve must not be listed, got: {entries:?}"
+    );
+    assert!(
+        !entries.contains(&"LICENSE".to_string()),
+        "a top-level file no mount path can resolve must not be listed, got: {entries:?}"
+    );
+    // The contract that matters: every name the listing shows must stat.
+    for name in &entries {
+        std::fs::metadata(skills.join(name)).unwrap_or_else(|e| {
+            panic!("listing must not show an unresolvable entry {name:?}: {e}")
+        });
+    }
+    // Management paths keep their passthrough label in both modes, so they
+    // stay listed and readable.
+    assert!(
+        entries.contains(&".bundled_manifest".to_string()),
+        "management entries must stay listed, got: {entries:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(skills.join(".bundled_manifest")).expect("read manifest"),
+        "manifest-content"
+    );
+    assert!(
+        entries.contains(&"apple".to_string()),
+        "categories must stay listed, got: {entries:?}"
+    );
+    assert!(
+        std::fs::metadata(skills.join("apple"))
+            .expect("stat category")
+            .is_dir(),
+        "a listed category must stat as a directory"
+    );
+}
+
+// -----------------------------------------------------------------------
 // 18c. Reserved lifecycle names stay hidden in an in-place Hermes mount.
 // -----------------------------------------------------------------------
 
