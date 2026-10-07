@@ -804,8 +804,10 @@ fn escape_for_diagnostics(text: &str) -> String {
 /// attacker-influenceable (the drift watcher's modeled threat). Printed raw,
 /// an embedded newline fabricates report lines and ESC/OSC sequences are
 /// live terminal commands (OSC 777 is a notification/title command). Text
-/// output escapes those control bytes; JSON output keeps serde's own
-/// escaping and is unaffected. Visible characters pass through unchanged.
+/// output escapes those control bytes — every Unicode control character, so
+/// the C1 block (NEL, CSI, OSC) is covered as well as C0/DEL; JSON output
+/// keeps serde's own escaping and is unaffected. Visible characters pass
+/// through unchanged.
 fn escape_ctl(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
@@ -813,7 +815,7 @@ fn escape_ctl(s: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            c if c.is_control() => {
                 escaped.push_str(&format!("\\x{:02x}", c as u32));
             }
             c => escaped.push(c),
@@ -2911,8 +2913,9 @@ async fn cmd_mount(
 /// forges diagnostic lines and ESC/OSC sequences are live terminal
 /// commands — and the classify diagnostics print in the default
 /// configuration (the structured warn! fields and the stderr summary
-/// alike). Same escaping as the list/validate text-output fix (kept as a
-/// separate helper so the two audit fixes land independently).
+/// alike). Same escaping as the list/validate text-output fix, C1 controls
+/// included (kept as a separate helper so the two audit fixes land
+/// independently).
 fn escape_ctl_stderr(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
@@ -2920,7 +2923,7 @@ fn escape_ctl_stderr(s: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            c if c.is_control() => {
                 escaped.push_str(&format!("\\x{:02x}", c as u32));
             }
             c => escaped.push(c),
@@ -3446,11 +3449,17 @@ mod tests {
         );
         assert_eq!(escape_ctl_stderr("\u{7f}"), "\\x7f");
         assert_eq!(escape_ctl_stderr("a\u{0}b"), "a\\x00b");
+        // C1 controls are terminal commands too — NEL (U+0085) breaks the
+        // line on xterm-class terminals, CSI (U+009B) and OSC (U+009D) are
+        // the 8-bit introducers — and a directory name may carry them.
+        assert_eq!(escape_ctl_stderr("a\u{85}b"), "a\\x85b");
+        assert_eq!(escape_ctl_stderr("\u{9b}31m"), "\\x9b31m");
+        assert_eq!(escape_ctl_stderr("\u{9d}777;id\u{7}"), "\\x9d777;id\\x07");
         // No raw control byte survives.
         assert!(
-            !escape_ctl_stderr("\u{1}\u{2}\n\u{1b}\u{7f}")
+            !escape_ctl_stderr("\u{1}\u{2}\n\u{1b}\u{7f}\u{85}\u{9b}")
                 .chars()
-                .any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
+                .any(|c| c.is_control())
         );
         // Visible text — including multi-byte characters — passes through.
         assert_eq!(
@@ -3818,6 +3827,19 @@ mod tests {
             !escape_ctl("\u{1}\u{2}\n\u{1b}")
                 .chars()
                 .any(|c| (c as u32) < 0x20)
+        );
+        // C1 controls are terminal commands too (NEL U+0085 breaks the line
+        // on xterm-class terminals, CSI U+009B and OSC U+009D are the 8-bit
+        // introducers) and a directory name may carry them, so they take the
+        // same escaping as the C0 bytes above.
+        assert_eq!(escape_ctl("a\u{85}b"), "a\\x85b");
+        assert_eq!(escape_ctl("\u{9b}31m"), "\\x9b31m");
+        assert_eq!(escape_ctl("\u{9d}777;id\u{7}"), "\\x9d777;id\\x07");
+        assert!(
+            !escape_ctl("\u{85}\u{9b}\u{9d}")
+                .chars()
+                .any(|c| c.is_control()),
+            "no control character may survive escaping"
         );
     }
 

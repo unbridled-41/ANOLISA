@@ -40,6 +40,19 @@ fn fabricated_line_present(stdout: &str) -> bool {
         .any(|line| line.trim() == "Injected: trusted summary line")
 }
 
+/// A source tree whose only skill directory name carries the C1 payloads:
+/// NEL (U+0085, a line break on xterm-class terminals), CSI (U+009B) and OSC
+/// (U+009D), the 8-bit forms of the ESC sequences the hostile tree above
+/// uses. Legal in a Linux filename and valid UTF-8, so the name survives the
+/// filesystem and reaches the printer verbatim.
+fn c1_tree(parent: &Path) -> std::path::PathBuf {
+    let source = parent.join("c1");
+    let dir = source.join("nel\u{85}Injected: forged\u{9b}31m\u{9d}777;id\u{7}");
+    std::fs::create_dir_all(&dir).expect("create C1-named skill dir");
+    std::fs::write(dir.join("SKILL.md"), "---\ndescription: d\n---\nb\n").expect("write SKILL.md");
+    source
+}
+
 #[test]
 fn list_text_output_escapes_control_characters_in_skill_names() {
     let holder = tempfile::tempdir().expect("holder tempdir");
@@ -70,6 +83,34 @@ fn list_text_output_escapes_control_characters_in_skill_names() {
     assert!(
         stdout.contains("\\x1b]777;id\\x07"),
         "the OSC-named skill must be listed with an escaped ESC: {stdout:?}"
+    );
+}
+
+#[test]
+fn list_text_output_escapes_c1_control_characters_in_skill_names() {
+    let holder = tempfile::tempdir().expect("holder tempdir");
+    let source = c1_tree(holder.path());
+
+    let out = Command::new(bin_path())
+        .args(["list", source.to_str().unwrap()])
+        .output()
+        .expect("invoke skillfs list");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "list should succeed, stdout={stdout}");
+
+    // No raw C1 byte may reach the terminal: NEL would break the report
+    // line and CSI/OSC would be live commands.
+    assert!(
+        !stdout.contains('\u{85}'),
+        "raw NEL (C1 line break) must not reach stdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.chars().any(|c| c.is_control() && c != '\n'),
+        "no raw control character may reach stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("nel\\x85Injected: forged\\x9b31m\\x9d777;id\\x07"),
+        "the C1-named skill must be listed with every C1 byte escaped: {stdout:?}"
     );
 }
 
