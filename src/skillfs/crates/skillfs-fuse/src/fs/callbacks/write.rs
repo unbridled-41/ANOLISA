@@ -1028,18 +1028,21 @@ impl SkillFs {
                 // Fall through to the shared physical setattr handling.
             }
             PathType::InboxSkillDir { skill_name } => {
-                // L1: the inbox skill candidate dir is the live source
-                // dir, so metadata reads project the physical dir's
-                // attrs and mutations are rejected with EROFS to match
-                // the existing `SkillDir` behavior. Lifecycle / xattr
-                // mutation policy stays unchanged.
+                // L1: the inbox skill candidate dir is the live source dir.
+                // A pure stat projects the physical dir's attrs, and metadata
+                // mutations route to that physical directory exactly like the
+                // `SkillDir` arm above — the same object is reachable as
+                // `/skills/<name>`, and `cp -a`/`rsync -a`/`install -p`
+                // restore mode and timestamps on the directory as their last
+                // step. Rejecting them here with EROFS (the old `SkillDir`
+                // behavior this arm was copied from) broke an
+                // attribute-preserving install through the documented inbox
+                // entrance after its files had already been written.
                 if !Self::is_inbox_skill_name_allowed(skill_name) {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                if has_mutation {
-                    reply.error(libc::EROFS);
-                } else {
+                if !has_mutation {
                     let physical = self.inbox_skill_dir(skill_name);
                     match std::fs::symlink_metadata(&physical) {
                         Ok(meta) => {
@@ -1049,8 +1052,25 @@ impl SkillFs {
                         }
                         Err(e) => reply.error(errno(&e)),
                     }
+                    return;
                 }
-                return;
+                // A directory has no size to truncate.
+                if size.is_some() {
+                    reply.error(libc::EISDIR);
+                    return;
+                }
+                // Ownership changes on the candidate directory stay
+                // restricted to privileged / trusted-writer callers, as on
+                // the `SkillDir` arm.
+                if (uid.is_some() || gid.is_some())
+                    && req.uid() != 0
+                    && !self.evaluate_trusted_writer(req).is_allowed()
+                {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+                // Fall through to the shared physical setattr handling, so
+                // the lifecycle and `.skill-meta` gates cover the path too.
             }
             PathType::SkillMd { skill_name } | PathType::Passthrough { skill_name, .. } => {
                 if is_skill_discover_path(skill_name) {

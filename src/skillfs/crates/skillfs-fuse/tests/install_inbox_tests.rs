@@ -691,6 +691,114 @@ fn create_at_inbox_skill_slot_is_refused_and_does_not_create_source_file() {
         .output();
 }
 
+/// The inbox candidate directory maps to the live source directory
+/// (`source/<name>`, the same object as `/skills/<name>`), so an
+/// attribute-preserving install through the documented inbox entrance
+/// must be able to restore mode and timestamps on it. It answered
+/// `EROFS` for every metadata mutation instead, which broke `cp -a`,
+/// `rsync -a`, `install -p` and `tar -x --preserve` at their final
+/// metadata step while the same directory accepted those calls through
+/// `/skills/<name>`.
+#[test]
+fn inbox_skill_dir_accepts_metadata_preservation() {
+    if !fuse_available() {
+        eprintln!("SKIP: FUSE not available");
+        return;
+    }
+
+    let source = tempfile::tempdir().expect("source");
+    create_skill_dir(source.path(), "anchor");
+    let mountpoint = tempfile::tempdir().expect("mount");
+    let mut store = SkillStore::new();
+    store.load_from_directory(source.path(), &ParseConfig::default());
+    let shared: SharedSkillStore = Arc::new(RwLock::new(store));
+    let handle = mount_background_configured(
+        mountpoint.path(),
+        source.path(),
+        shared,
+        MountOptions::default(),
+        false,
+        MountConfig {
+            active_resolver: None,
+            ..MountConfig::default()
+        },
+    )
+    .expect("mount");
+    // The fixture does not synchronize with the daemon; wait for the
+    // virtual inbox to answer before touching it.
+    let inbox_root = mountpoint.path().join(".skillfs-inbox");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(&inbox_root).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the mount did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let inbox_skill = inbox_root.join("copied-skill");
+    std::fs::create_dir(&inbox_skill).expect("mkdir at inbox slot");
+    let physical = source.path().join("copied-skill");
+    assert!(physical.is_dir(), "mkdir must create source/<skill>");
+
+    // chmod (setattr mode) on the candidate directory must reach it.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&inbox_skill, std::fs::Permissions::from_mode(0o750))
+        .expect("chmod through the inbox must succeed");
+    assert_eq!(
+        std::fs::metadata(&physical).unwrap().permissions().mode() & 0o7777,
+        0o750,
+        "the mode set through the inbox must land on the physical directory"
+    );
+
+    // utimensat (setattr atime/mtime) must reach it too — this is the
+    // step that made `cp -a` fail after it had already copied the files.
+    set_times_now(&inbox_skill).expect("utimensat through the inbox must succeed");
+
+    // A directory has no size to truncate: the refusal must come from the
+    // gate, never from a write performed on the physical directory. (The
+    // kernel rejects `ftruncate` on a directory inode before it reaches
+    // FUSE, so only the failure itself is asserted here.)
+    let truncate_err = std::fs::File::open(&inbox_skill)
+        .and_then(|f| f.set_len(0))
+        .expect_err("truncating the candidate directory must fail");
+    assert!(
+        matches!(
+            truncate_err.raw_os_error(),
+            Some(libc::EISDIR) | Some(libc::EINVAL)
+        ),
+        "expected EISDIR/EINVAL, got {truncate_err:?}"
+    );
+
+    drop(handle);
+    std::thread::sleep(Duration::from_millis(150));
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", &mountpoint.path().to_string_lossy()])
+        .output();
+}
+
+/// `utimensat(AT_FDCWD, path, UTIME_NOW)` helper: the same call `cp -a`
+/// and `touch` make when they restore timestamps on a directory.
+fn set_times_now(path: &Path) -> std::io::Result<()> {
+    let c_path = std::ffi::CString::new(path.to_string_lossy().into_owned())
+        .expect("CString path for utimensat");
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `create` (or `mkdir`) of the inbox virtual root itself must be
 /// refused with `EEXIST`, never fall through to the physical source
 /// path.
