@@ -114,7 +114,21 @@ impl SkillFs {
                         }
                     },
                 };
-                match std::fs::read_link(&physical) {
+                // The dentry resolves through the openat fallback, so the
+                // read must use `readlinkat` on the parent fd: plain
+                // `read_link` on the past-PATH_MAX physical path fails with
+                // ENAMETOOLONG while lookup/getattr already succeed.
+                let read_link_result = match std::fs::read_link(&physical) {
+                    Ok(target) => Ok(target),
+                    Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                        match self.open_parent_dir_for(&path) {
+                            Ok((parent_fd, leaf)) => crate::sys::readlinkat_leaf(&parent_fd, &leaf),
+                            Err(_) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                match read_link_result {
                     Ok(target) => {
                         use std::os::unix::ffi::OsStrExt;
                         let bytes = target.as_os_str().as_bytes();
@@ -157,7 +171,21 @@ impl SkillFs {
                     return;
                 }
                 let physical = self.inbox_skill_dir(&skill_name).join(&relative_path);
-                match std::fs::read_link(&physical) {
+                // The dentry resolves through the openat fallback, so the
+                // read must use `readlinkat` on the parent fd: plain
+                // `read_link` on the past-PATH_MAX physical path fails with
+                // ENAMETOOLONG while lookup/getattr already succeed.
+                let read_link_result = match std::fs::read_link(&physical) {
+                    Ok(target) => Ok(target),
+                    Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                        match self.open_parent_dir_for(&path) {
+                            Ok((parent_fd, leaf)) => crate::sys::readlinkat_leaf(&parent_fd, &leaf),
+                            Err(_) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                match read_link_result {
                     Ok(target) => {
                         use std::os::unix::ffi::OsStrExt;
                         let bytes = target.as_os_str().as_bytes();
@@ -196,7 +224,21 @@ impl SkillFs {
                     Some(p) => p,
                     None => return reply.error(libc::ENOENT),
                 };
-                match std::fs::read_link(&physical) {
+                // The dentry resolves through the openat fallback, so the
+                // read must use `readlinkat` on the parent fd: plain
+                // `read_link` on the past-PATH_MAX physical path fails with
+                // ENAMETOOLONG while lookup/getattr already succeed.
+                let read_link_result = match std::fs::read_link(&physical) {
+                    Ok(target) => Ok(target),
+                    Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                        match self.open_parent_dir_for(&path) {
+                            Ok((parent_fd, leaf)) => crate::sys::readlinkat_leaf(&parent_fd, &leaf),
+                            Err(_) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                match read_link_result {
                     Ok(target) => {
                         use std::os::unix::ffi::OsStrExt;
                         reply.data(target.as_os_str().as_bytes());
@@ -233,7 +275,21 @@ impl SkillFs {
                         None => return reply.error(libc::ENOENT),
                     },
                 };
-                match std::fs::read_link(&physical) {
+                // The dentry resolves through the openat fallback, so the
+                // read must use `readlinkat` on the parent fd: plain
+                // `read_link` on the past-PATH_MAX physical path fails with
+                // ENAMETOOLONG while lookup/getattr already succeed.
+                let read_link_result = match std::fs::read_link(&physical) {
+                    Ok(target) => Ok(target),
+                    Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                        match self.open_parent_dir_for(&path) {
+                            Ok((parent_fd, leaf)) => crate::sys::readlinkat_leaf(&parent_fd, &leaf),
+                            Err(_) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                match read_link_result {
                     Ok(target) => {
                         use std::os::unix::ffi::OsStrExt;
                         reply.data(target.as_os_str().as_bytes());
@@ -498,7 +554,20 @@ impl SkillFs {
             }
         };
 
-        match std::os::unix::fs::symlink(target, &physical) {
+        // `symlink(2)` on the full physical path fails with ENAMETOOLONG once
+        // the source prefix pushes the leaf past PATH_MAX; fall back to
+        // `symlinkat` anchored at the parent fd, like open/create/mkdir.
+        let symlink_result = match std::os::unix::fs::symlink(target, &physical) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                match self.open_parent_dir_for(&path_str) {
+                    Ok((parent_fd, leaf)) => crate::sys::symlinkat_leaf(&parent_fd, &leaf, target),
+                    Err(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match symlink_result {
             Ok(()) => {
                 let ino = self.inodes.allocate(&path_str, FileType::Symlink, parent);
                 self.inodes.remember(ino);
@@ -749,11 +818,26 @@ impl SkillFs {
         // operators can tell the rejection apart from an unimplemented
         // surface.  `ENOENT` and other stat errors fall through to a
         // `Failed` event preserving the underlying errno.
-        match std::fs::symlink_metadata(&src_physical) {
-            Ok(meta) if meta.file_type().is_file() => {
+        // Probe the source type through the parent fd when the physical path
+        // is past PATH_MAX: `std::fs::symlink_metadata` reports ENAMETOOLONG
+        // there, which would make a deep regular file unlinkable while its
+        // directory entries resolve fine.
+        let src_probe: std::io::Result<bool> = match std::fs::symlink_metadata(&src_physical) {
+            Ok(meta) => Ok(meta.file_type().is_file()),
+            Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                match self.open_parent_dir_for(&source_path_str) {
+                    Ok((parent_fd, leaf)) => crate::sys::fstatat_leaf(&parent_fd, &leaf, false)
+                        .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG),
+                    Err(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match src_probe {
+            Ok(true) => {
                 // OK — proceed to `hard_link` below.
             }
-            Ok(_) => {
+            Ok(false) => {
                 warn!(
                     op = "link",
                     src = %source_path_str,
@@ -794,7 +878,23 @@ impl SkillFs {
             }
         }
 
-        match std::fs::hard_link(&src_physical, &dst_physical) {
+        // Either side can sit past PATH_MAX in a deep source tree; resolve
+        // both parents through the fd so `linkat` addresses the leaves only.
+        let hard_link_result = match std::fs::hard_link(&src_physical, &dst_physical) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                let src_parent = self.open_parent_dir_for(&source_path_str);
+                let dst_parent = self.open_parent_dir_for(&new_path_str);
+                match (src_parent, dst_parent) {
+                    (Ok((src_fd, src_leaf)), Ok((dst_fd, dst_leaf))) => {
+                        crate::sys::linkat_leaf(&src_fd, &src_leaf, &dst_fd, &dst_leaf)
+                    }
+                    _ => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match hard_link_result {
             Ok(()) => {
                 let dst_ino = self
                     .inodes

@@ -187,6 +187,104 @@ pub(crate) fn fchownat_leaf(
     Ok(())
 }
 
+/// `symlinkat` against an open parent directory: the `*at` twin of
+/// `symlink(2)` for leaves whose full physical path would exceed `PATH_MAX`.
+pub(crate) fn symlinkat_leaf(
+    dir: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    target: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let leaf_c = cstring_from_os_str(leaf)?;
+    let target_c = cstring_from_os_str(target.as_os_str())?;
+    let rc = unsafe { libc::symlinkat(target_c.as_ptr(), dir.as_raw_fd(), leaf_c.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `linkat` between two open parent directories: the `*at` twin of
+/// `hard_link(2)` for a source or destination leaf beyond `PATH_MAX`.
+pub(crate) fn linkat_leaf(
+    old_dir: &std::fs::File,
+    old_leaf: &std::ffi::OsStr,
+    new_dir: &std::fs::File,
+    new_leaf: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let old_c = cstring_from_os_str(old_leaf)?;
+    let new_c = cstring_from_os_str(new_leaf)?;
+    let rc = unsafe {
+        libc::linkat(
+            old_dir.as_raw_fd(),
+            old_c.as_ptr(),
+            new_dir.as_raw_fd(),
+            new_c.as_ptr(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `mkfifoat` against an open parent directory: the `*at` twin of `mkfifo(2)`
+/// for a leaf beyond `PATH_MAX`.
+pub(crate) fn mkfifoat_leaf(
+    dir: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let c = cstring_from_os_str(leaf)?;
+    let rc = unsafe { libc::mkfifoat(dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `readlinkat` against an open parent directory: the `*at` twin of
+/// `read_link(2)` for a leaf beyond `PATH_MAX`.
+///
+/// `readlinkat(2)` truncates silently when the buffer is too short, so the
+/// target is read with a growing buffer and a full buffer means "retry
+/// larger" — the returned path is always the complete link target.
+pub(crate) fn readlinkat_leaf(
+    dir: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    let c = cstring_from_os_str(leaf)?;
+    let mut size = 1024usize;
+    loop {
+        let mut buf = vec![0u8; size];
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < buf.len() {
+            use std::os::unix::ffi::OsStringExt;
+            buf.truncate(n);
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        if size >= 64 * 1024 {
+            return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        }
+        size *= 4;
+    }
+}
+
 /// `utimensat` against an open parent directory: the same no-follow flag
 /// semantics as the plain-path form, without needing a nameable path.
 pub(crate) fn utimensat_leaf(

@@ -849,9 +849,22 @@ impl SkillFs {
                 return;
             }
         };
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), effective_mode as libc::mode_t) };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
+        // `mkfifo(2)` on the full physical path fails with ENAMETOOLONG once a
+        // deep source prefix pushes the leaf past PATH_MAX; fall back to
+        // `mkfifoat` anchored at the parent fd, like open/create/mkdir.
+        let mkfifo_result =
+            if unsafe { libc::mkfifo(c_path.as_ptr(), effective_mode as libc::mode_t) } == 0 {
+                Ok(())
+            } else {
+                let e = std::io::Error::last_os_error();
+                match self.open_parent_dir_for(&path_str) {
+                    Ok((parent_fd, leaf)) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                        crate::sys::mkfifoat_leaf(&parent_fd, &leaf, effective_mode)
+                    }
+                    _ => Err(e),
+                }
+            };
+        if let Err(e) = mkfifo_result {
             let err = errno(&e);
             warn!(op = "mknod", path = %path_str, error = %e, "mkfifo failed");
             self.emit_op_event(

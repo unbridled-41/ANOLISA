@@ -618,3 +618,77 @@ fn fuse_nofollow_setattr_via_openat_fallback_at_max_path() {
         );
     }
 }
+
+#[test]
+fn fuse_symlink_mkfifo_hardlink_readlink_via_openat_fallback() {
+    skip_if_no_fuse!();
+    let fx = match LongSourceMount::new() {
+        Some(fx) => fx,
+        None => return,
+    };
+
+    let target_abs_len = PATH_MAX_LINUX + 30;
+    let (deep_source_parent, leaf) = seed_dirs_to_overflow(&fx.source_sandbox(), target_abs_len);
+    let relative = deep_source_parent
+        .strip_prefix(fx.source_sandbox())
+        .expect("relative under sandbox")
+        .to_owned();
+    let mount_parent = fx.mount_sandbox().join(&relative);
+    assert!(
+        std::fs::metadata(&mount_parent).is_ok(),
+        "mount-side parent must exist via FUSE"
+    );
+
+    // The physical leaf path is past PATH_MAX, so the plain libc calls the
+    // symlink/link/mknod/readlink arms used returned ENAMETOOLONG while
+    // mkdir/create/unlink/rename all fall back to the parent-fd syscalls.
+    let link_name = format!("{leaf}-symlink");
+    let symlink_path = mount_parent.join(&link_name);
+    std::os::unix::fs::symlink("target.txt", &symlink_path).unwrap_or_else(|e| {
+        panic!("symlink at a past-PATH_MAX physical leaf must use symlinkat, got {e}")
+    });
+
+    let fifo_name = format!("{leaf}-fifo");
+    let fifo_path = mount_parent.join(&fifo_name);
+    let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("fifo CString");
+    let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo at a past-PATH_MAX physical leaf must use mkfifoat, got {}",
+        std::io::Error::last_os_error()
+    );
+
+    let hard_name = format!("{leaf}-hard");
+    let hard_path = mount_parent.join(&hard_name);
+    // T2 scope: only ordinary regular files are hardlinkable, so the source is
+    // a regular file created through the mount (whose own openat fallback is
+    // covered above).
+    let regular_path = mount_parent.join(format!("{leaf}-regular"));
+    std::fs::write(&regular_path, b"link source").expect("create a deep regular file");
+    std::fs::hard_link(&regular_path, &hard_path).unwrap_or_else(|e| {
+        panic!("hard link to a past-PATH_MAX physical leaf must use linkat, got {e}")
+    });
+
+    // readlink must resolve through the same fallback: lookup already has it,
+    // so the dentry resolves while the plain readlink(2) would not.
+    let read = std::fs::read_link(&symlink_path)
+        .expect("readlink at a past-PATH_MAX physical leaf must use readlinkat");
+    assert_eq!(read, PathBuf::from("target.txt"));
+
+    // State on the source side, checked through the parent fd that fits.
+    let source_parent_fd = open_dir_for_at(&deep_source_parent).expect("open source parent fd");
+    for name in [&link_name, &fifo_name, &hard_name] {
+        let c = CString::new(name.as_str()).unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                source_parent_fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "{name} must exist on the source side");
+    }
+}
