@@ -186,7 +186,12 @@ fn parse_frontmatter(
     dir_name: &str,
     issues: &mut Vec<String>,
 ) -> SkillMetadata {
-    if yaml_str.is_empty() {
+    // Whitespace-only frontmatter is empty frontmatter: the block may keep a
+    // stray space or tab from the blank line the author left, but it carries
+    // no YAML, and handing those bytes to serde_yaml turned them into an
+    // "invalid YAML" issue (EOF / bad token) that classifies the whole entry
+    // as Error instead of the Degraded "missing frontmatter".
+    if yaml_str.trim().is_empty() {
         if !dir_name.is_empty() {
             issues.push("missing frontmatter".to_string());
         }
@@ -625,6 +630,45 @@ Search the web.
 
         assert_eq!(entry.metadata.name, "web-search"); // from dir_name
         assert!(entry.parse_status.is_degraded());
+    }
+
+    #[test]
+    fn whitespace_only_frontmatter_is_missing_not_invalid() {
+        // A blank line inside an otherwise empty frontmatter keeps whatever
+        // whitespace the author typed, so the "is the block empty?" test has
+        // to trim: the block is still empty frontmatter and must take the
+        // same "missing frontmatter" degradation as the `---\n---` shape.
+        // Left raw, the stray byte reached serde_yaml, which reported `EOF
+        // while parsing a value`; that issue is classified as Error, so
+        // `validate` exited 1 and a multi-source mount refused to start over
+        // a cosmetic whitespace line.
+        for content in [
+            "---\n \n---\n\n# Web Search\n\nSearch the web.\n",
+            "---\n\t\n---\n\n# Web Search\n\nSearch the web.\n",
+            "---\n  \n---\n\nBody text.\n",
+        ] {
+            let entry = parse_skill_md(content, "web-search");
+            assert!(
+                entry.parse_status.is_degraded(),
+                "whitespace-only frontmatter must degrade, not error: {:?} for {content:?}",
+                entry.parse_status
+            );
+            assert_eq!(
+                entry.metadata.name, "web-search",
+                "the directory name still names the skill"
+            );
+        }
+        // The body fallback still describes the skill.
+        let entry = parse_skill_md(
+            "---\n \n---\n\n# Web Search\n\nSearch the web.\n",
+            "web-search",
+        );
+        assert_eq!(entry.metadata.description, "Search the web.");
+        assert!(
+            !entry.body.contains("---"),
+            "frontmatter fences must not leak into the body: {:?}",
+            entry.body
+        );
     }
 
     #[test]
