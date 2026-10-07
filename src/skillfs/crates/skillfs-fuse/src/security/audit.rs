@@ -382,10 +382,17 @@ impl JsonlFileAuditSink {
             config.queue_capacity
         };
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The operator-configured audit log is an append target written
+            // by the daemon; O_NOFOLLOW refuses a symlink planted in its
+            // place instead of writing audit records through it.
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&config.path)?;
 
         let (tx, rx) = sync_channel::<SkillEvent>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -643,6 +650,33 @@ mod tests {
         assert_eq!(first["path"], "scripts/run.sh");
         assert_eq!(second["kind"], "policy_denied");
         assert_eq!(second["errno"].as_i64().unwrap(), libc::EACCES as i64);
+    }
+
+    #[test]
+    fn jsonl_file_sink_does_not_follow_a_symlinked_log() {
+        // The audit log is an operator-configured append target written by
+        // the daemon; a symlink planted in its place must be refused rather
+        // than silently redirecting the audit records into another file.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        let log = dir.path().join("audit.jsonl");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+
+        let err = match JsonlFileAuditSink::new(AuditConfig::new(&log)) {
+            Ok(_) => panic!("a symlink at the audit path must be refused, not followed"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from the no-follow open, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the symlink target must not receive audit lines"
+        );
     }
 
     #[test]

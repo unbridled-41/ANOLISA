@@ -178,10 +178,17 @@ impl JsonlProtocolEventWriter {
             queue_capacity
         };
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Same deployment-owned append target as the audit and metrics
+            // logs: a planted symlink must not redirect the protocol-event
+            // stream into another file.
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path)?;
 
         let (tx, rx) = sync_channel::<ProtocolEvent>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -523,6 +530,33 @@ mod tests {
         assert_eq!(events[1].skill_name, "beta");
         assert_eq!(events[1].event_kind, "mkdir");
         assert!(events[1].paths.is_empty());
+    }
+
+    #[test]
+    fn symlinked_log_path_is_not_followed() {
+        // Same deployment-owned append target as the audit and metrics logs:
+        // a planted symlink must not turn the protocol-event stream into an
+        // arbitrary-file append performed with the daemon's privileges.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        let path = dir.path().join("protocol-events.jsonl");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = match JsonlProtocolEventWriter::new(&path, 0) {
+            Ok(_) => panic!("a symlink at the log path must be refused, not followed"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from the no-follow open, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the symlink target must not receive event lines"
+        );
     }
 
     #[test]

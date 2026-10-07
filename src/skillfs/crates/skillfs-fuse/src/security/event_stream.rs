@@ -189,10 +189,18 @@ impl JsonlSecurityEventWriter {
             queue_capacity
         };
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A legit events log is never a symlink; O_NOFOLLOW blocks a
+            // planted link from redirecting the JSONL stream into another
+            // file, the same guard the audit and metrics writers apply to
+            // this deployment-owned append path.
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path)?;
 
         let (tx, rx) = sync_channel::<SecurityEvent>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -440,6 +448,36 @@ mod tests {
         let events = w.events();
         assert_eq!(events[0].skill, "alpha");
         assert_eq!(events[1].ledger_status.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn symlinked_log_path_is_not_followed() {
+        // The deployment-owned events log is never a symlink, and this
+        // process appends to it with whatever privilege it started with.
+        // Following a planted link would let whoever can create a name in
+        // the log's directory append attacker-chosen JSONL to an arbitrary
+        // file; the sibling audit/metrics writers open with `O_NOFOLLOW`
+        // for exactly this reason.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        let path = dir.path().join("demo-events.jsonl");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = match JsonlSecurityEventWriter::new(&path, 0) {
+            Ok(_) => panic!("a symlink at the log path must be refused, not followed"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from the no-follow open, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the symlink target must not receive event lines"
+        );
     }
 
     #[test]
