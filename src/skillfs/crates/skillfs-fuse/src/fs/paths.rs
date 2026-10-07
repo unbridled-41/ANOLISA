@@ -78,15 +78,31 @@ impl SkillFs {
     ///
     /// In in-place mode uses `source_base()` (the pre-opened fd path) so
     /// reads bypass the FUSE mount layer.
+    ///
+    /// The directory itself comes from the store entry, which is the only
+    /// place that knows where the skill really lives: a categorized source
+    /// stores `<source>/<category>/<skill>`. Rejoining the bare skill name
+    /// for the in-place path named a directory that does not exist and made
+    /// every read of a categorized skill fail with ENOENT; the relative
+    /// segment is therefore re-anchored on the pre-opened fd, falling back
+    /// to `<source>/<name>` only when the store has no entry (a fresh
+    /// install candidate).
     pub(super) fn skill_physical_dir(&self, skill_name: &str) -> PathBuf {
         if self.in_place {
             // Always go through the fd to bypass the FUSE mount.
-            self.source_base().join(skill_name)
-        } else {
-            self.skill_source_path(skill_name)
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| self.source.join(skill_name))
+            return match self.skill_source_path(skill_name).and_then(|p| {
+                let dir = p.parent()?.to_path_buf();
+                Some(dir.strip_prefix(&self.source).ok()?.to_path_buf())
+            }) {
+                Some(relative) if !relative.as_os_str().is_empty() => {
+                    self.source_base().join(relative)
+                }
+                _ => self.source_base().join(skill_name),
+            };
         }
+        self.skill_source_path(skill_name)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| self.source.join(skill_name))
     }
 
     /// Resolve the live directory used by flat installer-authorized I/O.

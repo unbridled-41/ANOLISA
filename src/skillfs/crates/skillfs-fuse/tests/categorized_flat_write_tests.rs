@@ -229,3 +229,82 @@ fn categorized_source_supports_flat_reads_writes_and_sync() {
 
     handle.unmount().expect("unmount categorized source");
 }
+
+/// In-place flat mount over a categorized source: the skill lives at
+/// `<source>/catalog/demo`, and the store records exactly that. The
+/// in-place resolver rejoined the bare skill name (`<source>/demo`), so
+/// every read of a skill that the store had loaded from a category
+/// subdirectory failed with ENOENT through the mount even though the
+/// listing advertised it.
+#[test]
+fn in_place_flat_mount_serves_a_categorized_source() {
+    skip_if_no_fuse!();
+
+    let source = tempfile::tempdir().expect("source tempdir");
+    let skill_dir = source.path().join("catalog/demo");
+    std::fs::create_dir_all(&skill_dir).expect("categorized skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: categorized\n---\noriginal body\n",
+    )
+    .expect("categorized SKILL.md");
+    std::fs::write(skill_dir.join("notes.txt"), "original notes").expect("categorized passthrough");
+
+    let mut initial_store = SkillStore::new();
+    initial_store.load_from_directory(source.path(), &ParseConfig::default());
+    let store: SharedSkillStore = Arc::new(RwLock::new(initial_store));
+    assert_eq!(
+        store.read().get("demo").expect("loaded demo").source_path,
+        skill_dir.join("SKILL.md")
+    );
+
+    // In-place mode: the mountpoint is the source root, so the FUSE mount
+    // replaces the filesystem view of `source`. Wait for it by watching the
+    // directory identity change from the underlying filesystem.
+    let source_dev = std::fs::metadata(source.path()).unwrap().dev();
+    let handle = mount_background_configured(
+        source.path(),
+        source.path(),
+        store.clone(),
+        MountOptions::default(),
+        true,
+        MountConfig::default(),
+    )
+    .expect("mount categorized source in place");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            std::fs::metadata(source.path())
+                .map(|meta| meta.dev() != source_dev)
+                .unwrap_or(false)
+        }),
+        "the in-place mount did not appear"
+    );
+
+    // The flat view lists the store's skills...
+    let mut names: Vec<String> = std::fs::read_dir(source.path())
+        .expect("read in-place root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    assert!(
+        names.contains(&"demo".to_string()),
+        "the categorized skill must be listed, got {names:?}"
+    );
+
+    // ...and every listed skill must resolve to the directory the store
+    // recorded for it, not to a nonexistent `<source>/<name>`.
+    let body = std::fs::read_to_string(source.path().join("demo/SKILL.md"))
+        .expect("read /demo/SKILL.md through the in-place mount");
+    assert!(
+        body.contains("original body"),
+        "the manifest must be served, got {body:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("demo/notes.txt"))
+            .expect("read a passthrough file through the in-place mount"),
+        "original notes"
+    );
+
+    handle.unmount().expect("unmount categorized source");
+}

@@ -99,10 +99,14 @@ impl SkillFs {
         let physical = match resolution {
             ReadResolution::Hidden => return None,
             ReadResolution::Snapshot { dir, .. } => dir.join("SKILL.md"),
-            ReadResolution::Source if category.is_some() || self.in_place => {
+            // A Hermes nested id is relative to the source root in both
+            // modes; a flat id must go through the store, which is the only
+            // place that knows a categorized skill lives at
+            // `<source>/<category>/<skill>`.
+            ReadResolution::Source if category.is_some() => {
                 self.source_base().join(&id).join("SKILL.md")
             }
-            ReadResolution::Source => self.skill_source_path(&id)?,
+            ReadResolution::Source => self.skill_physical_dir(&id).join("SKILL.md"),
         };
         let (content, metadata) = self
             .load_transformed(&id, &physical, target.as_ref())
@@ -126,14 +130,11 @@ impl SkillFs {
         }
         let physical_path = match self.resolve_skill_read(skill_name) {
             ReadResolution::Hidden => return None,
-            ReadResolution::Source => {
-                if self.in_place {
-                    // Bypass the FUSE layer via the pre-opened fd.
-                    self.source_base().join(skill_name).join("SKILL.md")
-                } else {
-                    self.skill_source_path(skill_name)?
-                }
-            }
+            // `skill_physical_dir` resolves through the store and re-anchors
+            // on the pre-opened fd in in-place mode, so a categorized
+            // source's `<source>/<category>/<skill>` is addressed correctly
+            // instead of the nonexistent `<source>/<skill>`.
+            ReadResolution::Source => self.skill_physical_dir(skill_name).join("SKILL.md"),
             ReadResolution::Snapshot { dir, .. } => dir.join("SKILL.md"),
         };
         let raw = std::fs::read_to_string(&physical_path).ok()?;
@@ -200,13 +201,7 @@ impl SkillFs {
         };
         let physical_path = match resolution {
             ReadResolution::Hidden => return None,
-            ReadResolution::Source => {
-                if self.in_place {
-                    self.source_base().join(skill_name).join("SKILL.md")
-                } else {
-                    self.skill_source_path(skill_name)?
-                }
-            }
+            ReadResolution::Source => self.skill_physical_dir(skill_name).join("SKILL.md"),
             ReadResolution::Snapshot { dir, .. } => dir.join("SKILL.md"),
         };
         let raw = std::fs::read_to_string(&physical_path).ok()?;
