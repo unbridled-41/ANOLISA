@@ -302,6 +302,43 @@ fn extract_first_paragraph(body: &str) -> String {
 // Phase 3: Section Splitting
 // ---------------------------------------------------------------------------
 
+/// Section name of a level-2 ATX heading on `line`, or `None` when the line is
+/// not one.
+///
+/// CommonMark lets either a space or a tab follow the hashes and allows an
+/// optional closing `#` sequence, so `## Parameters`, `##\tParameters` and
+/// `## Parameters ##` all name the section `Parameters` — and the description
+/// path already treats all three as headings ([`is_atx_heading`]). Matching
+/// only the exact `## ` spelling the previous `strip_prefix` accepted silently
+/// produced an *empty* contract section for the other two spellings, with a
+/// clean `ParseStatus::Ok`: the parameters/returns the author wrote were
+/// dropped without a single degradation issue. As before, only a heading at
+/// the start of the line opens a section, and `##`, `### x`, `##X` and an
+/// indented `## x` are not level-2 headings.
+fn section_heading(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("##")?;
+    match rest.chars().next() {
+        Some(' ') | Some('\t') => Some(strip_atx_closing_sequence(rest)),
+        _ => None,
+    }
+}
+
+/// Drop a heading's optional closing `#` sequence. CommonMark requires the
+/// sequence to be preceded by a space or tab (`## Parameters ##`); a `#` glued
+/// to the text (`## Parameters#`) is part of the heading text, so such a line
+/// names a different section and is left alone.
+fn strip_atx_closing_sequence(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let without_hashes = trimmed.trim_end_matches('#');
+    if without_hashes.len() == trimmed.len() {
+        return trimmed;
+    }
+    match without_hashes.chars().next_back() {
+        Some(' ') | Some('\t') => without_hashes.trim_end(),
+        _ => trimmed,
+    }
+}
+
 fn split_sections(
     body: &str,
     issues: &mut Vec<String>,
@@ -326,7 +363,7 @@ fn split_sections(
             open_fence = Some(fence);
             continue;
         }
-        if let Some(heading) = line.strip_prefix("## ") {
+        if let Some(heading) = section_heading(line) {
             if let Some(name) = current_name.take() {
                 record_section(&mut sections, name, current_content, issues);
             }
@@ -1079,6 +1116,102 @@ description: Query the agentsight dashboard
             entry.parse_status
         );
         assert!(entry.parameters.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Section Heading Spellings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_contract_heading_with_closing_sequence_is_a_section() {
+        // `## Parameters ##` is a level-2 ATX heading whose text is
+        // `Parameters` (CommonMark: the trailing `#` run is a closing
+        // sequence). The exact `## ` prefix match the splitter used missed it,
+        // so the whole contract section was dropped while the entry still
+        // reported `ParseStatus::Ok` — no issue, no degradation, nothing for
+        // `validate` to report.
+        let content = r#"---
+name: test
+description: Test skill
+---
+
+## Parameters ##
+
+- `query` (string, required): The search query
+
+## Returns ##
+
+- `result` (array, required): The result
+"#;
+
+        let entry = parse_skill_md(content, "test");
+
+        assert_eq!(
+            entry.parameters.len(),
+            1,
+            "status: {:?}",
+            entry.parse_status
+        );
+        assert_eq!(entry.parameters[0].name, "query");
+        assert_eq!(entry.returns.len(), 1);
+        assert_eq!(entry.returns[0].name, "result");
+        assert!(
+            entry.parse_status.is_ok(),
+            "the heading spelling must not degrade anything: {:?}",
+            entry.parse_status
+        );
+    }
+
+    #[test]
+    fn test_contract_heading_with_tab_is_a_section() {
+        // A tab after the hashes is the other legal separator (CommonMark),
+        // and `is_atx_heading` already treats it as a heading for the
+        // description fallback: the splitter must agree.
+        let content = "---\nname: test\ndescription: Test skill\n---\n\n##\tParameters\n\n- `query` (string, required): The search query\n";
+
+        let entry = parse_skill_md(content, "test");
+
+        assert_eq!(
+            entry.parameters.len(),
+            1,
+            "status: {:?}",
+            entry.parse_status
+        );
+        assert_eq!(entry.parameters[0].name, "query");
+        assert!(entry.parse_status.is_ok());
+    }
+
+    #[test]
+    fn test_contract_heading_spellings_that_are_not_sections() {
+        // Boundaries of the heading grammar stay unopened: `###`/`#` are other
+        // levels, `##X` is not a heading at all, an indented `## x` is not a
+        // top-level section, and a `#` glued to the text belongs to the
+        // heading text (so the section is named `Parameters#`, not
+        // `Parameters`). None of these may feed structured extraction.
+        for heading in [
+            "### Parameters",
+            "# Parameters",
+            "##Parameters",
+            "  ## Parameters",
+        ] {
+            let content = format!(
+                "---\nname: test\ndescription: Test skill\n---\n\n{heading}\n\n- `query` (string, required): The search query\n"
+            );
+            let entry = parse_skill_md(&content, "test");
+            assert!(
+                entry.parameters.is_empty(),
+                "{heading:?} must not open the Parameters section: {:?}",
+                entry.parameters
+            );
+        }
+
+        let glued = "---\nname: test\ndescription: Test skill\n---\n\n## Parameters#\n\n- `query` (string, required): The search query\n";
+        let entry = parse_skill_md(glued, "test");
+        assert!(
+            entry.parameters.is_empty(),
+            "a glued `#` is part of the heading text: {:?}",
+            entry.parameters
+        );
     }
 
     // -----------------------------------------------------------------------
