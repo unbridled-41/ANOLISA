@@ -88,8 +88,33 @@ pub fn mount_configured(
         config.os_adapter,
         config.directive_enabled,
         config.skill_discover_root,
+        None,
     )
 }
+
+/// Readiness report a background mount worker sends to the thread that
+/// started it.
+///
+/// The worker cannot report the mount itself as "done" — `fuser::mount2`
+/// blocks for the whole session — so it reports the two states the starter
+/// can act on: pre-flight passed and the mount is about to be installed, or
+/// the session ended before it became ready.
+#[derive(Debug)]
+enum MountProgress {
+    /// Validation passed and the worker is about to install the mount.
+    Starting,
+    /// The mount never became ready; the session ended first.
+    Failed(FuseError),
+}
+
+/// Upper bound on the pre-flight phase of a background mount (validation,
+/// stale-mount cleanup), after which the worker must have reported
+/// [`MountProgress::Starting`].
+const BACKGROUND_MOUNT_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on the wait for the mount to appear at the mountpoint after
+/// the worker reported that it is installing it.
+const BACKGROUND_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Mount the SkillFS FUSE filesystem in the background (non-blocking)
 /// with a unified configuration struct.
@@ -104,9 +129,24 @@ pub fn mount_background_configured(
     let mountpoint_path = mountpoint.to_path_buf();
     let source_path = source.to_path_buf();
 
+    // Readiness is observed through the mountpoint's identity, not through a
+    // sleep: a fixed sleep returned `Ok` for a mount that had not appeared yet
+    // (or had already failed on the worker thread), and the caller then read
+    // the plain directory behind the mountpoint instead of the FUSE view. The
+    // pre-fix in-place symptom is the worst case of that: the caller sees the
+    // raw source tree, as if SkillFS were not mounted at all.
+    let baseline = std::fs::symlink_metadata(mountpoint).ok().map(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    });
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<MountProgress>();
+
     let handle = std::thread::spawn(move || {
         let mut opts = options;
         opts.foreground = true;
+        // Every failure is reported to the starter, whether it happened in
+        // pre-flight validation or in the mount itself: the starter must not
+        // have to guess whether "worker exited" meant "never mounted".
         if let Err(e) = mount_inner(
             &mountpoint_path,
             &source_path,
@@ -129,17 +169,81 @@ pub fn mount_background_configured(
             config.os_adapter,
             config.directive_enabled,
             config.skill_discover_root,
+            Some(progress_tx.clone()),
         ) {
             error!(error = %e, "background mount failed");
+            let _ = progress_tx.send(MountProgress::Failed(e));
         }
     });
 
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_background_mount(mountpoint, baseline, &progress_rx)?;
 
     Ok(MountHandle {
         mountpoint: mountpoint.to_path_buf(),
         session: Some(handle),
     })
+}
+
+/// Wait until the background worker's mount is actually serving at
+/// `mountpoint`.
+///
+/// Two phases: the pre-flight report (`MountProgress`), which surfaces
+/// validation and cleanup failures that used to be swallowed by the worker
+/// thread, and then the appearance of the mount itself, detected by the
+/// mountpoint's device/inode changing away from the pre-mount pair. The
+/// identity probe is deliberately path-form independent — a caller whose
+/// mountpoint traverses a symlink still sees the same `stat` result — and it
+/// covers both mount modes, including the in-place layout where the mount
+/// hides the very directory the caller named.
+fn wait_for_background_mount(
+    mountpoint: &Path,
+    baseline: Option<(u64, u64)>,
+    progress_rx: &std::sync::mpsc::Receiver<MountProgress>,
+) -> Result<(), FuseError> {
+    match progress_rx.recv_timeout(BACKGROUND_MOUNT_PREFLIGHT_TIMEOUT) {
+        Ok(MountProgress::Starting) => {}
+        Ok(MountProgress::Failed(e)) => return Err(e),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(FuseError::MountFailed(
+                "the background mount worker exited before it started the session".to_string(),
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(FuseError::MountFailed(format!(
+                "the background mount worker did not reach the mount in {}s",
+                BACKGROUND_MOUNT_PREFLIGHT_TIMEOUT.as_secs()
+            )));
+        }
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    let deadline = std::time::Instant::now() + BACKGROUND_MOUNT_READY_TIMEOUT;
+    loop {
+        let mounted = std::fs::symlink_metadata(mountpoint)
+            .map(|meta| Some((meta.dev(), meta.ino())) != baseline)
+            .unwrap_or(false);
+        if mounted {
+            return Ok(());
+        }
+        match progress_rx.try_recv() {
+            Ok(MountProgress::Failed(e)) => return Err(e),
+            Ok(MountProgress::Starting) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(FuseError::MountFailed(
+                    "the background mount worker exited before the mount appeared".to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(FuseError::MountFailed(format!(
+                "the background mount at {} did not appear within {}s",
+                mountpoint.display(),
+                BACKGROUND_MOUNT_READY_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Internal mount that accepts optional Skill Security overrides. Public
@@ -169,6 +273,7 @@ fn mount_inner(
     os_adapter: Option<OsAdapterStage>,
     directive_enabled: Option<bool>,
     skill_discover_root: Option<PathBuf>,
+    progress: Option<std::sync::mpsc::Sender<MountProgress>>,
 ) -> Result<(), FuseError> {
     info!(mountpoint = %mountpoint.display(), source = %source.display(), in_place, "mounting SkillFS");
 
@@ -332,6 +437,13 @@ fn mount_inner(
         libc::umask(0);
     }
 
+    // Pre-flight is done and the stale-mount cleanup above removed whatever
+    // occupied the path before: from here on the only mount that can appear at
+    // the mountpoint is ours, so a starter may wait for it.
+    if let Some(progress) = progress.as_ref() {
+        let _ = progress.send(MountProgress::Starting);
+    }
+
     match fuser::mount2(fs, mountpoint, &fuse_opts) {
         Ok(()) => {
             info!("filesystem unmounted");
@@ -352,7 +464,7 @@ pub fn mount(
 ) -> Result<(), FuseError> {
     mount_inner(
         mountpoint, source, store, options, in_place, None, None, None, None, None, None, None,
-        None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None,
     )
 }
 
@@ -382,7 +494,7 @@ pub fn mount_with_security(
 ) -> Result<(), FuseError> {
     mount_inner(
         mountpoint, source, store, options, in_place, event_sink, policy, None, None, None, None,
-        None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
     )
 }
 
@@ -417,6 +529,7 @@ pub fn mount_with_security_and_active_resolver(
         event_sink,
         policy,
         active_resolver,
+        None,
         None,
         None,
         None,
@@ -477,6 +590,7 @@ pub fn mount_with_security_active_resolver_and_demo_refresh(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -519,6 +633,7 @@ pub fn mount_with_security_active_resolver_demo_refresh_and_trusted_writer(
         refresh_controller,
         None,
         trusted_writer,
+        None,
         None,
         None,
         None,
@@ -688,6 +803,7 @@ pub fn mount_background_with_security_active_resolver_demo_refresh_and_trusted_w
             refresh_controller,
             None,
             trusted_writer,
+            None,
             None,
             None,
             None,
