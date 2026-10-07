@@ -127,10 +127,12 @@ pub(crate) struct CompiledRules {
     /// Source literals that must be matched-and-preserved during the scan, so a
     /// shorter eligible rule cannot rewrite inside them. These come from rules
     /// that are ineligible for this target — `auto_apply: never`, identity
-    /// (`from == to`), or direction-disallowed. A source/match-mode pair that is
-    /// also an eligible substitution is excluded (substitution wins), so
-    /// protection never suppresses a real mapping. Different modes for the same
-    /// source coexist and are evaluated independently by the scanner.
+    /// (`from == to`), or direction-disallowed — and from the replacement of
+    /// every eligible rule, which is this target's own canonical spelling. A
+    /// source/match-mode pair that is also an eligible substitution is excluded
+    /// (substitution wins), so protection never suppresses a real mapping.
+    /// Different modes for the same source coexist and are evaluated
+    /// independently by the scanner.
     pub protects: Vec<CompiledProtection>,
     /// Number of rules parsed from the artifact (before direction filtering).
     pub total_rules: usize,
@@ -189,6 +191,9 @@ pub(crate) fn compile(
     // strip any source/match-mode pair that is also eligible afterward.
     let mut protects: Vec<CompiledProtection> = Vec::new();
     let mut protect_seen: HashSet<(String, MatchMode)> = HashSet::new();
+    // The replacement side of every rule — eligible or not — is a canonical
+    // spelling for the resolved target, protected after the loop below.
+    let mut target_spellings: Vec<(String, MatchMode)> = Vec::new();
     for (index, raw) in raw_rules.iter().enumerate() {
         let direction =
             Direction::parse(&raw.direction).ok_or_else(|| OsAdapterError::InvalidDirection {
@@ -225,11 +230,13 @@ pub(crate) fn compile(
             });
         }
 
-        // Source is the opposite side of the target we convert toward.
+        // Source is the opposite side of the target we convert toward; `to` is
+        // therefore already written in this target's spelling.
         let (from, to) = match target {
             OsTarget::Alinux => (&raw.ubuntu, &raw.alinux),
             OsTarget::Ubuntu => (&raw.alinux, &raw.ubuntu),
         };
+        target_spellings.push((to.clone(), match_mode));
 
         // A rule contributes a real substitution only when it is eligible for
         // this target and actually changes bytes. Everything else (never,
@@ -266,6 +273,27 @@ pub(crate) fn compile(
             target: to.clone(),
             match_mode,
         });
+    }
+
+    // A rule's replacement is the canonical spelling for the resolved target,
+    // so text that already reads that way is already correct and must not be
+    // rewritten. Without this, every source that is a proper prefix of its own
+    // replacement corrupts the target spelling it just produced, and does so
+    // again on every re-read: `libpng-dev` -> `libpng-devel` turns an existing
+    // `libpng-devel` into `libpng-develel` (52 rules on Alinux), and
+    // `rust` -> `rustc` turns `rustc` into `rustcc` / `golang-go` into
+    // `golang-go-go` / `redis` -> `redis-server` turns `redis-server` into
+    // `redis-server-server` on Ubuntu. The replacement participates in the
+    // scan exactly like the existing ineligible-rule protections: it wins by
+    // being the longest match at its position, while a longer eligible source
+    // still wins over it.
+    for (spelling, match_mode) in target_spellings {
+        if protect_seen.insert((spelling.clone(), match_mode)) {
+            protects.push(CompiledProtection {
+                source: spelling,
+                match_mode,
+            });
+        }
     }
 
     // Substitutions take precedence over protection for the same source/mode

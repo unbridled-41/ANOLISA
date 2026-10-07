@@ -28,8 +28,10 @@ pub struct OsAdapterStage {
     /// read (see the `TransformStage::apply` impl).
     rules: Vec<rules::CompiledRule>,
     /// Source literals matched-and-preserved during the scan (ineligible rules:
-    /// never / identity / direction-disallowed), so a shorter eligible rule
-    /// cannot rewrite inside a span an ineligible rule claims.
+    /// never / identity / direction-disallowed, plus every rule's replacement —
+    /// the resolved target's own spelling), so a shorter eligible rule cannot
+    /// rewrite inside a span an ineligible rule claims or a spelling that is
+    /// already canonical for this target.
     protects: Vec<rules::CompiledProtection>,
     /// Content-free digest of the rule artifact bytes, for diagnostics.
     digest: String,
@@ -149,6 +151,10 @@ impl TransformStage for OsAdapterStage {
         // match it is emitted verbatim and skipped, so a shorter eligible rule
         // cannot rewrite inside a span an ineligible rule claims (e.g. the
         // `never` path `/etc/init.d/apache2` is not corrupted by `apache2`).
+        // Every rule's replacement joins that set for the same reason: it is
+        // the canonical spelling for this target, and a source that is a proper
+        // prefix of its own replacement would otherwise corrupt it
+        // (`libpng-devel` -> `libpng-develel`, `rustc` -> `rustcc`).
         let mut out = String::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
@@ -638,6 +644,116 @@ mod tests {
         let stage = stage_from(yaml, OsTarget::Alinux).unwrap();
         // `ab` -> `bc` (not `x`); the literal `bc` in input -> `x`.
         assert_eq!(stage.apply("ab bc"), "bc x");
+    }
+
+    #[test]
+    fn replacement_spelling_is_protected_from_rewriting() {
+        // A rule's replacement is the canonical spelling for the resolved
+        // target, so text that already reads that way must survive the scan.
+        // Without this, a source that is a proper prefix of its own replacement
+        // rewrites the target spelling it just produced: `libpng-dev` ->
+        // `libpng-devel` turned an existing `libpng-devel` into
+        // `libpng-develel` (52 catalog rules on Alinux), and `rust` -> `rustc`
+        // turned `rustc` into `rustcc` on Ubuntu. The transform is not
+        // idempotent otherwise.
+        let yaml = "- ubuntu: libpng-dev\n  alinux: libpng-devel\n  direction: bidirectional\n  auto_apply: always\n\
+                    - ubuntu: rustc\n  alinux: rust\n  direction: bidirectional\n  auto_apply: always\n";
+        let alinux = stage_from(yaml, OsTarget::Alinux).unwrap();
+        assert_eq!(alinux.apply("libpng-dev"), "libpng-devel");
+        assert_eq!(alinux.apply("libpng-devel"), "libpng-devel");
+        assert_eq!(alinux.apply(&alinux.apply("libpng-dev")), "libpng-devel");
+
+        let ubuntu = stage_from(yaml, OsTarget::Ubuntu).unwrap();
+        assert_eq!(ubuntu.apply("rust"), "rustc");
+        assert_eq!(ubuntu.apply("rustc"), "rustc");
+        assert_eq!(ubuntu.apply(&ubuntu.apply("rust")), "rustc");
+    }
+
+    #[test]
+    fn longer_source_still_wins_over_a_replacement_protection() {
+        // Protection must not suppress a real mapping: a longer eligible source
+        // that starts at the same position still wins over a shorter rule's
+        // replacement span.
+        let yaml = "- ubuntu: dev\n  alinux: devel\n  direction: bidirectional\n  auto_apply: always\n\
+                    - ubuntu: dev-tools\n  alinux: devel-tools\n  direction: bidirectional\n  auto_apply: always\n";
+        let alinux = stage_from(yaml, OsTarget::Alinux).unwrap();
+        // `devel-tools` is the target spelling of the longer rule: protected.
+        assert_eq!(alinux.apply("devel-tools"), "devel-tools");
+        // `dev-tools` -> `devel-tools` (the longer source), not `devel-tools`
+        // from the shorter `dev` rule plus a trailing `-tools`.
+        assert_eq!(alinux.apply("dev-tools"), "devel-tools");
+    }
+
+    #[test]
+    fn builtin_catalog_preserves_every_target_spelling() {
+        // Catalog-wide guard for the rule above, enumerated from the raw
+        // artifact: for the resolved target, the artifact's own spelling on
+        // that side of every rule must survive the full compiled stage.
+        let value: serde_yaml::Value = serde_yaml::from_slice(BUILTIN_RULES).unwrap();
+        let seq = value.as_sequence().unwrap();
+        for (selector, side) in [
+            (TargetSelector::Alinux, "alinux"),
+            (TargetSelector::Ubuntu, "ubuntu"),
+        ] {
+            let stage = OsAdapterStage::load_default(selector).unwrap();
+            for rule in seq {
+                let spelling = rule
+                    .get(side)
+                    .and_then(|v| v.as_str())
+                    .expect("every rule carries both sides");
+                assert_eq!(
+                    stage.apply(spelling),
+                    spelling,
+                    "target {}: the artifact's own spelling {spelling:?} must survive the stage",
+                    stage.target().as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_catalog_does_not_mangle_target_package_names() {
+        // Concrete regressions from the catalog-wide guard: every one of these
+        // is the spelling the resolved target is supposed to produce, and the
+        // transform used to corrupt it (`libpng-develel`, `rustcc`,
+        // `redis-server-server`, `golang-go-go`, `postgresql-client-client`).
+        let alinux = OsAdapterStage::load_default(TargetSelector::Alinux).unwrap();
+        for spelling in [
+            "libpng-devel",
+            "libzstd-devel",
+            "libcap-devel",
+            "libssh-devel",
+            "nmap-ncat",
+        ] {
+            assert_eq!(
+                alinux.apply(spelling),
+                spelling,
+                "target alinux: {spelling:?} must stay intact"
+            );
+        }
+        assert_eq!(
+            alinux.apply("dnf install -y libpng-devel"),
+            "dnf install -y libpng-devel"
+        );
+
+        let ubuntu = OsAdapterStage::load_default(TargetSelector::Ubuntu).unwrap();
+        for spelling in [
+            "rustc",
+            "golang-go",
+            "redis-server",
+            "iputils-ping",
+            "iproute2",
+            "postgresql-client",
+            "texlive-latex-base",
+            "libmicrohttpd-dev",
+            "update-alternatives ",
+        ] {
+            assert_eq!(
+                ubuntu.apply(spelling),
+                spelling,
+                "target ubuntu: {spelling:?} must stay intact"
+            );
+        }
     }
 
     #[test]

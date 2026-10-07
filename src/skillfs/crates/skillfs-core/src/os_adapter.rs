@@ -49,7 +49,11 @@
 //! equal, or direction-disallowed for the resolved target) still take part in
 //! the scan as *protection* matches: when one is the longest match it is emitted
 //! unchanged and skipped, so a shorter eligible rule cannot rewrite inside a
-//! span such a rule claims. Protection deduplication uses `(source, match)`:
+//! span such a rule claims. A rule's replacement is a *protection* match too —
+//! it is this target's canonical spelling, so text that already reads that way
+//! is correct and must survive the pass (`libpng-devel` is not rewritten into
+//! `libpng-develel` by the shorter `libpng-dev` source). Protection
+//! deduplication uses `(source, match)`:
 //! an eligible substitution removes protection only for the same source and
 //! match mode. Different modes coexist; a substitution takes precedence only
 //! when its own mode matches the current input, otherwise a matching protection
