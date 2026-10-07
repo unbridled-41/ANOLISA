@@ -393,11 +393,19 @@ impl ActivationFreshness {
     }
 }
 
+/// Whether an observed freshness component changed since the baseline.
+///
+/// Any change counts, not only a forward timestamp move. A *removed*
+/// artifact is the fail-safe `Hidden` decision — and the artifact lives under
+/// `.skill-meta/`, so deleting it does not touch the skill directory's own
+/// timestamps — while a restored or copied artifact can legitimately carry an
+/// older mtime than the one observed before it. Reporting "not advanced" for
+/// either left the resolver serving the previous target until some unrelated
+/// write happened to advance the directory.
 fn time_advanced(baseline: &Option<SystemTime>, current: &Option<SystemTime>) -> bool {
     match (baseline, current) {
-        (None, Some(_)) => true,
-        (Some(b), Some(c)) => c > b,
-        _ => false,
+        (None, None) => false,
+        _ => baseline != current,
     }
 }
 

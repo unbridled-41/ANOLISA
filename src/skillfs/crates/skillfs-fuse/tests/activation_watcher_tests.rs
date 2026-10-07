@@ -642,3 +642,59 @@ fn notify_send_failure_auto_registers_for_convergence() {
     notify_ctrl.shutdown();
     watcher.shutdown();
 }
+
+/// Withdrawing the activation artifact after the mount converged must move
+/// the view to the fail-safe `Hidden`, exactly as a missing artifact at
+/// mount time does. The freshness check only treated a *forward* timestamp
+/// move as a change, so deleting `.skill-meta/activation.json` (which
+/// touches the metadata directory, not the skill directory) left the
+/// resolver serving the withdrawn target until some unrelated write
+/// happened to advance the skill directory's timestamps.
+#[test]
+fn activation_removed_after_start_hides_the_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_skill_dir(dir.path(), "alpha");
+    setup_skill_with_snapshot(dir.path(), "alpha", "v000001");
+    setup_skill_with_activation(
+        dir.path(),
+        "alpha",
+        r#"{"schemaVersion": 1, "target": ".skill-meta/versions/v000001.snapshot"}"#,
+    );
+
+    let resolver = Arc::new(ActiveSkillResolver::new(dir.path()));
+    let reload_ctrl = make_reload_controller(dir.path(), resolver.clone());
+    let writer = Arc::new(InMemoryProtocolEventWriter::new());
+    let watcher = ActivationWatcher::new(reload_ctrl, writer.clone(), Duration::from_millis(100));
+    watcher.register_skill("alpha");
+    watcher.start();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !matches!(resolver.get("alpha"), Some(ActiveTarget::Snapshot { .. })) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher did not converge on the snapshot target: {:?}",
+            resolver.get("alpha")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The daemon withdraws the decision.
+    std::fs::remove_file(dir.path().join("alpha/.skill-meta/activation.json"))
+        .expect("remove activation artifact");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match resolver.get("alpha") {
+            Some(ActiveTarget::Hidden { .. }) => break,
+            other => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a withdrawn activation artifact must hide the skill, still serving {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    watcher.shutdown();
+}
