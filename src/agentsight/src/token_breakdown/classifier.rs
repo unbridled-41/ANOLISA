@@ -254,4 +254,16 @@ mod tests {
         let doc = classify_document(&blocks, None);
         assert_eq!(doc.system_content, "First prompt.\nSecond prompt.\n");
     }
+    #[test]
+    fn system_blocks_keep_one_boundary_when_the_next_starts_with_a_newline() {
+        // The next block may already begin with the boundary (a template that
+        // keeps it in the content); the separator must not add a blank line.
+        let blocks = vec![
+            make_block("system", "First prompt."),
+            make_block("system", "\nSecond prompt."),
+            make_block("user", "hello"),
+        ];
+        let doc = classify_document(&blocks, None);
+        assert_eq!(doc.system_content, "First prompt.\nSecond prompt.");
+    }
 }
