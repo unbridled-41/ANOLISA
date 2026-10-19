@@ -1433,18 +1433,39 @@ mod tests {
     }
 
     #[test]
+    fn non_sse_anthropic_body_keeps_thinking() {
+        let body = json!({
+            "type": "message",
+            "content": [
+                {"type": "thinking", "thinking": "reason first"},
+                {"type": "text", "text": "answer"}
+            ]
+        });
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&[sse(&body.to_string())]);
+        assert_eq!(resp.reasoning_content.as_deref(), Some("reason first"));
+        assert_eq!(resp.content, vec!["answer".to_string()]);
+    }
+
+    #[test]
     fn non_sse_responses_body_keeps_the_answer() {
         let body = json!({
             "object": "response",
             "output": [
                 {"type": "message", "role": "assistant",
                  "content": [{"type": "output_text", "text": "hello there"}]},
-                {"type": "function_call", "name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                {"type": "function_call", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                {"type": "custom_tool_call", "name": "custom", "input": "payload"}
             ]
         });
         let resp = AnalyzeChatmlCommand::extract_response_from_sse(&[sse(&body.to_string())]);
         assert_eq!(resp.content, vec!["hello there".to_string()]);
-        assert_eq!(resp.tool_calls, vec![r#"lookup: {"q":"x"}"#.to_string()]);
+        assert_eq!(
+            resp.tool_calls,
+            vec![
+                r#"lookup: {"q":"x"}"#.to_string(),
+                "custom: payload".to_string()
+            ]
+        );
     }
 
     #[test]
