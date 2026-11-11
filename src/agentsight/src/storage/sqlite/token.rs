@@ -532,7 +532,12 @@ impl TokenStore {
             return Vec::new();
         };
 
-        let Ok(rows) = stmt.query_map(params![start_ns as i64, end_ns as i64], |row| {
+        // Saturate rather than wrap: a bound above i64::MAX turns negative
+        // under `as i64` and reverses the range (an "until year 2262" end
+        // bound matched nothing). SQLite cannot store a later timestamp.
+        let start = start_ns.min(i64::MAX as u64) as i64;
+        let end = end_ns.min(i64::MAX as u64) as i64;
+        let Ok(rows) = stmt.query_map(params![start, end], |row| {
             Ok(TokenRecord {
                 id: row.get(0)?,
                 timestamp_ns: row.get::<_, i64>(1)? as u64,
@@ -595,9 +600,12 @@ impl TokenStore {
     /// Returns the number of deleted rows.
     pub fn purge_before(&self, cutoff_ns: u64) -> anyhow::Result<u64> {
         let sql = format!("DELETE FROM {} WHERE timestamp_ns < ?1", self.table_name);
+        // A cutoff past i64::MAX purges every representable row; wrapping it
+        // negative would delete nothing instead.
+        let cutoff = cutoff_ns.min(i64::MAX as u64) as i64;
         let deleted = self
             .conn
-            .execute(&sql, params![cutoff_ns as i64])
+            .execute(&sql, params![cutoff])
             .map_err(|e| anyhow::anyhow!("Failed to purge token records: {e}"))?;
         Ok(deleted as u64)
     }
@@ -874,6 +882,37 @@ mod tests {
 
         let records = store.all();
         assert!(!records.is_empty());
+
+        cleanup_db(&path);
+    }
+
+    /// A bound above `i64::MAX` wraps negative under `as i64`, which reversed
+    /// both a time-range end bound and a purge cutoff.
+    #[test]
+    fn absurd_time_bounds_saturate_instead_of_wrapping() {
+        let path = unique_db_path("absurd_bounds");
+        let mut store = TokenStore::new(&path).unwrap();
+        store
+            .add(TokenRecord::new(
+                1234,
+                "python".to_string(),
+                "openai".to_string(),
+                100,
+                50,
+            ))
+            .unwrap();
+
+        assert!(
+            store.by_time_range_owned(u64::MAX, u64::MAX).is_empty(),
+            "a range past every stored timestamp matches nothing"
+        );
+        assert_eq!(
+            store.by_time_range_owned(0, u64::MAX).len(),
+            1,
+            "an end bound past every stored timestamp keeps the row"
+        );
+        assert_eq!(store.purge_before(u64::MAX).unwrap(), 1);
+        assert!(store.all().is_empty());
 
         cleanup_db(&path);
     }
