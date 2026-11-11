@@ -117,7 +117,12 @@ impl HttpStore {
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since_ns as i64], |row| Ok(row_to_record(row)))?;
+        // Saturate rather than wrap: a bound above i64::MAX turns negative
+        // under `as i64`, which reverses its meaning ("since year 2262"
+        // becomes "every row"). SQLite cannot store a later timestamp.
+        let rows = stmt.query_map(params![since_ns.min(i64::MAX as u64) as i64], |row| {
+            Ok(row_to_record(row))
+        })?;
 
         let mut records = Vec::new();
         for row in rows {
@@ -195,7 +200,10 @@ impl HttpStore {
     /// Returns the number of deleted rows.
     pub fn purge_before(&self, cutoff_ns: u64) -> Result<u64> {
         let sql = format!("DELETE FROM {} WHERE timestamp_ns < ?1", self.table_name);
-        let deleted = self.conn.execute(&sql, params![cutoff_ns as i64])?;
+        // A cutoff past i64::MAX purges every representable row; wrapping it
+        // negative would delete nothing instead.
+        let cutoff = cutoff_ns.min(i64::MAX as u64) as i64;
+        let deleted = self.conn.execute(&sql, params![cutoff])?;
         Ok(deleted as u64)
     }
 
@@ -344,6 +352,46 @@ mod tests {
 
         let count = store.count().unwrap();
         assert_eq!(count, 1);
+
+        cleanup_db(&path);
+    }
+
+    /// A time bound above `i64::MAX` wraps negative under `as i64`, which
+    /// reversed both a "since" query and a purge cutoff. Saturating keeps the
+    /// bound's meaning.
+    #[test]
+    fn absurd_time_bounds_saturate_instead_of_wrapping() {
+        let path = test_db_path("absurd_bounds");
+        let _ = fs::remove_file(&path);
+        let store = HttpStore::new(&path).unwrap();
+        let record = HttpRecord {
+            timestamp_ns: 1_000_000_000,
+            pid: 1234,
+            comm: "python".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status_code: 200,
+            request_headers: "{}".to_string(),
+            request_body: None,
+            response_headers: "{}".to_string(),
+            response_body: None,
+            duration_ns: 1,
+            first_output_timestamp_ns: None,
+            is_sse: false,
+            sse_event_count: 0,
+        };
+        store.insert(&record).unwrap();
+
+        assert!(
+            store.query_since(u64::MAX).unwrap().is_empty(),
+            "a bound past every stored timestamp matches nothing"
+        );
+        assert_eq!(
+            store.purge_before(u64::MAX).unwrap(),
+            1,
+            "a cutoff past every stored timestamp removes the row"
+        );
+        assert_eq!(store.count().unwrap(), 0);
 
         cleanup_db(&path);
     }
