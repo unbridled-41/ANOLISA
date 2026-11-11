@@ -39,8 +39,10 @@ fn contains_tool_failure_signal(raw: &str) -> bool {
     // response's text verbatim, so the same error signals apply — with the
     // generic words excluded like everywhere else in this file.
     let text = raw.to_ascii_lowercase();
-    text.contains("tool_call_response")
-        && (text.contains("\"error\"") || text.contains("traceback"))
+    // The response can also ride inside a JSON string, where the key's quotes
+    // are escaped (`\"error\"`); the unescaped spelling cannot occur there.
+    let error_key = text.contains("\"error\"") || text.contains("\\\"error\\\"");
+    text.contains("tool_call_response") && (error_key || text.contains("traceback"))
 }
 
 fn contains_structured_tool_failure_signal(raw: &str) -> bool {
@@ -441,6 +443,23 @@ mod tests {
             Some(r#"[{"role":"user","content":"run the tool"}]"#),
             Some(
                 r#"[{"role":"assistant","content":"tool_call_response: {\"error\":\"failed to read config\", \"traceback\":\"FileNotFoundError\"}"}]"#,
+            ),
+            None,
+        );
+
+        assert!(looks_like_tool_failure(&event));
+    }
+
+    #[test]
+    fn detects_a_tool_failure_in_an_escaped_error_key() {
+        // The assistant embeds the tool response as text, so its `error` key
+        // reaches the column with escaped quotes. The raw scan looked only for
+        // the unescaped spelling, which cannot occur inside a JSON string, so
+        // the failure was missed unless the payload also carried a traceback.
+        let event = event(
+            Some(r#"[{"role":"user","content":"run the tool"}]"#),
+            Some(
+                r#"[{"role":"assistant","content":"tool_call_response: {\"error\":\"failed to read config\"}"}]"#,
             ),
             None,
         );
