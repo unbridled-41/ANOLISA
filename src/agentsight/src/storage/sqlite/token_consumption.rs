@@ -259,13 +259,19 @@ impl TokenConsumptionStore {
 
         let mut stmt = self.conn.prepare(&sql)?;
 
-        // Bind parameters positionally
+        // Bind parameters positionally. Saturate bounds above i64::MAX:
+        // wrapping them negative reverses the range (an "until year 2262"
+        // end bound matched nothing). SQLite cannot store a later timestamp.
         let mut param_values: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(v) = filter.start_ns {
-            param_values.push(rusqlite::types::Value::Integer(v as i64));
+            param_values.push(rusqlite::types::Value::Integer(
+                v.min(i64::MAX as u64) as i64
+            ));
         }
         if let Some(v) = filter.end_ns {
-            param_values.push(rusqlite::types::Value::Integer(v as i64));
+            param_values.push(rusqlite::types::Value::Integer(
+                v.min(i64::MAX as u64) as i64
+            ));
         }
         if let Some(ref v) = filter.provider {
             param_values.push(rusqlite::types::Value::Text(v.clone()));
@@ -377,7 +383,9 @@ impl TokenConsumptionStore {
     pub fn purge_before(&self, cutoff_ns: u64) -> anyhow::Result<u64> {
         let deleted = self.conn.execute(
             &format!("DELETE FROM {} WHERE timestamp_ns < ?1", self.table_name),
-            params![cutoff_ns as i64],
+            // A cutoff past i64::MAX purges every representable row;
+            // wrapping it negative would delete nothing instead.
+            params![cutoff_ns.min(i64::MAX as u64) as i64],
         )?;
         Ok(deleted as u64)
     }
@@ -483,6 +491,39 @@ mod tests {
         assert_eq!(rec.total_input_tokens, 150);
         assert_eq!(rec.total_output_tokens, 80);
         assert_eq!(rec.by_role().get("user"), Some(&100));
+
+        cleanup_db(&path);
+    }
+
+    /// A bound above `i64::MAX` wraps negative under `as i64`, which reversed
+    /// both a time-range end bound and a purge cutoff.
+    #[test]
+    fn absurd_time_bounds_saturate_instead_of_wrapping() {
+        let path = unique_db_path("absurd_bounds");
+        let store = TokenConsumptionStore::new(&path).unwrap();
+        let bd = make_breakdown("openai", "gpt-4o");
+        store.insert(&bd, 1_000_000_000, 123, "python").unwrap();
+
+        let filter = TokenConsumptionFilter {
+            start_ns: Some(0),
+            end_ns: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            store.query(&filter).unwrap().len(),
+            1,
+            "an end bound past every stored timestamp keeps the row"
+        );
+        let empty = TokenConsumptionFilter {
+            start_ns: Some(u64::MAX),
+            end_ns: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(
+            store.query(&empty).unwrap().is_empty(),
+            "a range past every stored timestamp matches nothing"
+        );
+        assert_eq!(store.purge_before(u64::MAX).unwrap(), 1);
 
         cleanup_db(&path);
     }
