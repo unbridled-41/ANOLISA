@@ -156,12 +156,21 @@ fn read_metadata(
     read_plain(agent, base_url, path)
 }
 
+/// IMDSv2 session-token header. The service only recognises the official
+/// `X-aliyun-ecs-metadata-token` spelling (the same one documented in
+/// `os-skills/aliyun/aliyun-ecs/references/metadata-api.md` and sent by
+/// cosh-ng).
+const TOKEN_HEADER: &str = "X-aliyun-ecs-metadata-token";
+
+/// TTL header for the token request; without it the PUT is rejected.
+const TOKEN_TTL_HEADER: &str = "X-aliyun-ecs-metadata-token-ttl-seconds";
+
 /// Attempt to read metadata with an IMDSv2 session token.
 fn read_with_token(agent: &ureq::Agent, url: &str, token: &str) -> Option<String> {
     agent
         .get(url)
         .set("X-Forwarded-For", "China")
-        .set("X-Alibaba-Cloud-Ecs-Metadata-Token", token)
+        .set(TOKEN_HEADER, token)
         .call()
         .ok()
         .and_then(|r| r.into_string().ok())
@@ -193,7 +202,7 @@ fn get_imdsv2_token(agent: &ureq::Agent, base_url: &str) -> Option<String> {
 
     agent
         .put(&token_url)
-        .set("X-Alibaba-Cloud-Ecs-Metadata-Token-Ttl-Seconds", "300")
+        .set(TOKEN_TTL_HEADER, "300")
         .call()
         .ok()
         .and_then(|r| r.into_string().ok())
@@ -346,6 +355,77 @@ mod tests {
                 }
             });
         }
+
+        /// Serve metadata the way a hardened (IMDSv2-only) ECS host does: the
+        /// token PUT succeeds only with the official TTL header, and every
+        /// metadata GET must carry the official token header. An IMDSv1 read
+        /// is rejected, so the probe can only succeed through IMDSv2.
+        fn serve_metadata_imdsv2_only(self, fields: Vec<(&'static str, &'static str)>) {
+            let listener = self.listener;
+            std::thread::spawn(move || {
+                // Accept up to 8 connections (token + 4 fields; the probe
+                // performs no IMDSv1 fallback against this server).
+                for _ in 0..8 {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut reader = BufReader::new(&stream);
+
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut headers: Vec<String> = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                            break;
+                        }
+                        headers.push(line.trim().to_ascii_lowercase());
+                    }
+
+                    let is_put = request_line.starts_with("PUT");
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    let has_ttl_header = headers
+                        .iter()
+                        .any(|h| h == "x-aliyun-ecs-metadata-token-ttl-seconds: 300");
+                    let has_token_header = headers
+                        .iter()
+                        .any(|h| h == "x-aliyun-ecs-metadata-token: mock-token-abc");
+
+                    let (status, body) = if is_put {
+                        if path == "/latest/api/token" && has_ttl_header {
+                            ("200 OK", "mock-token-abc".to_string())
+                        } else {
+                            ("400 Bad Request", "missing token ttl header".to_string())
+                        }
+                    } else if !has_token_header {
+                        ("401 Unauthorized", "imdsv2 token required".to_string())
+                    } else {
+                        (
+                            "200 OK",
+                            fields
+                                .iter()
+                                .find(|(k, _)| path.ends_with(k))
+                                .map(|(_, v)| v.to_string())
+                                .unwrap_or_else(|| "not-found".to_string()),
+                        )
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+        }
     }
 
     #[test]
@@ -489,6 +569,28 @@ mod tests {
         assert_eq!(meta.region_id, "cn-shanghai");
         assert_eq!(meta.eip, "8.8.8.8");
         assert!(meta.public_ipv4.is_empty());
+    }
+
+    /// Alibaba Cloud's IMDSv2 uses `X-aliyun-ecs-metadata-token` and
+    /// `X-aliyun-ecs-metadata-token-ttl-seconds`; the repository documents the
+    /// same names in `os-skills/aliyun/aliyun-ecs/references/metadata-api.md`
+    /// and cosh-ng sends them. This client used
+    /// `X-Alibaba-Cloud-Ecs-Metadata-Token[-Ttl-Seconds]`, which the service
+    /// ignores: on a host that requires IMDSv2 the token request was rejected,
+    /// the IMDSv1 fallback was rejected too, and the probe reported non-ECS.
+    #[test]
+    fn probe_uses_the_official_imdsv2_headers() {
+        let server = MockServer::bind();
+        let base = server.meta_base.clone();
+        server.serve_metadata_imdsv2_only(vec![
+            ("instance-id", "i-imdsv2only"),
+            ("region-id", "cn-hangzhou"),
+        ]);
+
+        let meta = probe_ecs_metadata_with(&base)
+            .expect("an IMDSv2-only host must be probed with the official headers");
+        assert_eq!(meta.instance_id, "i-imdsv2only");
+        assert_eq!(meta.region_id, "cn-hangzhou");
     }
 
     #[test]
