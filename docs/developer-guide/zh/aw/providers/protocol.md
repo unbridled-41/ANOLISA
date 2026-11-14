@@ -48,8 +48,9 @@ JSON 文档。公共信封拒绝未知字段；Provider 私有配置和原生
 ```
 
 描述最多声明 64 个操作及其支持的事件和效果，操作名不得为空或重复。声明来自 Provider，不能
-扩大 Adapter 的可信能力或证明运行时身份。词表识别配置中的全部 16 个事件，本阶段
-准入支持 `input.submit`、`tool.before` 和 `tool.after`。提交检查需要受支持的 resident 入口，
+扩大 Adapter 的可信能力或证明运行时身份。词表识别配置中的全部 16 个事件。当前
+Provider 执行链在所选 Adapter 支持相应事件与效果时，准入 `input.submit`、
+`tool.before`、`tool.after` 和 `security.violation`。提交检查需要受支持的 resident 入口，
 例如 Qoder SDK、QwenPaw 或 Pi。
 
 操作可以通过可选 `event_adapters` 限制某个事件支持的 Adapter，例如
@@ -79,7 +80,8 @@ Host 一起部署；旧 Host 在发现阶段会拒绝未知字段。
 
 调用包含配置的操作、私有配置、配置版本、剩余预算、允许的效果、统一事件和不透明
 输入摘要。通过检查的成功响应返回相同摘要及候选效果列表。空列表不增加约束；
-`observe` 请求观测，`block` 请求阻止尚未执行的工具调用。两者都是候选效果，
+`observe` 请求观测；`block` 可拒绝待提交输入或尚未执行的工具调用，也可在支持
+`security.violation` 的 Adapter 边界暂扣最终工具结果。两者都是候选效果，
 库本身不写入审计记录。这些响应均不授予原生权限。
 `Outcome::requests_block()` 只报告候选效果中是否包含阻断请求。
 
@@ -138,12 +140,13 @@ Provider 的精确私有配置一致。成功返回已检查的步骤；不返�
 | 请求 | 准入结果 |
 | --- | --- |
 | `input.submit`：`observe`、`block` | Provider 与 Adapter 均支持时通过；拒绝工具选择器和原始 native-hook 步骤 |
-| `tool.before`：`observe`、`block` | 所选操作和 Adapter 均支持全部请求效果时通过 |
+| `tool.before`：`observe`、`block`、`replace_input` | 所选操作和 Adapter 均支持全部请求效果时通过 |
 | `tool.after`：`observe` | 双方均支持时通过 |
 | `tool.after`：`replace_result` | 单个结构化步骤与可信文本替换能力 |
-| `ask`、输入替换、执行后阻断 | 拒绝 |
-| 启用提交和两个工具事件以外的事件 | 拒绝，`required: false` 也不例外 |
-| `security.violation` 等 guard | 拒绝，本模型尚未实现最后一道检查的顺序保证 |
+| `security.violation`：`observe`、`block` | Provider 与 Adapter 均支持时用于 DeepSeek Harness 最终结果边界 |
+| `ask`、`tool.after` 阻断 | 拒绝 |
+| 启用 Adapter 不支持的事件 | 拒绝，`required: false` 也不例外 |
+| `events.tool.before.guard` 配置字段 | 运行时准入拒绝；工具执行前的检查配置在 `tool.before` 步骤中 |
 | 事件与步骤的 `match.tools` | 接受；Host 仅调用同时匹配两层选择器的工具 |
 | 高于 `native_hook` 的保证 | 拒绝 |
 | 缺少 Provider、操作、能力或匹配的配置校验证据 | 拒绝，并给出明确原因 |
@@ -218,7 +221,7 @@ Schema 增量沿用实验性的 v1alpha1 协议。CLI、服务及 Provider 须�
 
 ### Tokenless 组合
 
-PreTool 通过 `block` 返回完整重试建议，新调用重新经过安全与原生权限检查；PostTool 只替换获准文本槽。
+PreTool 可返回单个 `replace_input` 效果，以对象 `input` 提供候选参数并保留全部原参数键。该步骤须位于首个适用 before 位置，只声明该效果，所有 before 步骤使用 `on_error: block`。后续检查接收候选参数，最后一个成功回调沿用原身份和预算交付改写，保留原生授权。旧 `block` 重试建议继续受支持；PostTool 只替换获准文本槽。 SDK 托管 MCP handler 的输入替换在候选检查前拒绝；未改写的 MCP 调用及 PostTool 沿用既有路径。
 RTK 归属、结果分类和遥测设置见[Tokenless 参考](tokenless.md)。
 当前接入的恢复能力为 `none`，Schema/BeforeModel 与 Retrieve 接点尚未开放。
 Core 计划 API 的独立合同见[Core 执行](../../../../../src/aw/docs/design/zh/core-execution.md)。

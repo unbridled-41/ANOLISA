@@ -1,5 +1,6 @@
 """Install V2 products from a standalone component source tree without compiling."""
 
+import ast
 import os
 import shlex
 import shutil
@@ -27,6 +28,7 @@ class DeliveryTests(unittest.TestCase):
             "packaging/validate-stage.py",
             "packaging/systemd/agent-sec-core-v2.service.in",
             "packaging/systemd/skillsec.json",
+            "packaging/sandbox/permissions.json.template",
         ):
             destination = self.source / name
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -57,9 +59,13 @@ class DeliveryTests(unittest.TestCase):
             "gateway/asc_gateway_addon.py",
             "gateway/asc_gateway_policy.py",
             "gateway/mitmproxy.provenance",
-            "gateway/github-policy.json",
+            "gateway/github.cedar",
         ):
             self.artifact(name, "fixture\n")
+        self.artifact(
+            "cosh-extension/hooks/sandbox_paths.py",
+            (ROOT / "cosh-extension/hooks/sandbox_paths.py").read_text(),
+        )
         self.artifact(
             "gateway/install-mitmproxy.sh",
             "#!/bin/sh\nexit 91\n",
@@ -69,6 +75,55 @@ class DeliveryTests(unittest.TestCase):
             shutil.copy2(
                 ROOT / "packaging/gateway" / name, self.build / "gateway" / name
             )
+
+    def test_sandbox_template_install_preserves_edits_and_matches_hook_layout(self):
+        stage = self.base / "sandbox-stage"
+        args = ("install", f"DESTDIR={stage}", "CONFIGDIR=/srv/config")
+        result = self.make(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        template = stage / "srv/config/sandbox/permissions.json.template"
+        self.assertEqual(
+            template.read_bytes(),
+            (ROOT / "packaging/sandbox/permissions.json.template").read_bytes(),
+        )
+        self.assertEqual(template.stat().st_mode & 0o777, 0o644)
+        hook = (
+            stage / "usr/share/anolisa/extensions/agent-sec-core/hooks/sandbox_paths.py"
+        )
+        self.assertEqual(
+            ast.literal_eval(ast.parse(hook.read_text()).body[1].value),
+            "/srv/config/sandbox/permissions.json.template",
+        )
+        template.write_text("administrator configuration")
+        template.chmod(0o600)
+        result = self.make(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(template.read_text(), "administrator configuration")
+        self.assertEqual(template.stat().st_mode & 0o777, 0o600)
+
+    def test_sandbox_install_renders_literal_paths(self) -> None:
+        stage = self.base / "quoted-stage"
+        for config in ("/srv/a&b", "/srv/a'b", '/srv/a"b', "/srv/a\\b| c"):
+            with self.subTest(config=config):
+                result = self.make(
+                    "install-source-v2-cosh-extension",
+                    "install-sandbox-permissions",
+                    f"DESTDIR={stage}",
+                    "EXTENSIONDIR=/extensions/agent-sec-core",
+                    f"SYSTEM_SEC_CORE_CONFIG_DIR={config}",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                hook = stage / "extensions/agent-sec-core/hooks/sandbox_paths.py"
+                self.assertEqual(
+                    ast.literal_eval(ast.parse(hook.read_text()).body[1].value),
+                    f"{config}/sandbox/permissions.json.template",
+                )
+                self.assertEqual(
+                    (
+                        stage / config.lstrip("/") / "sandbox/permissions.json.template"
+                    ).read_bytes(),
+                    (ROOT / "packaging/sandbox/permissions.json.template").read_bytes(),
+                )
 
     def artifact(self, name, contents, executable=False):
         destination = self.build / name
@@ -325,7 +380,7 @@ class DeliveryTests(unittest.TestCase):
         )
         self.assertTrue((stage / "srv/config/skillsec.json").is_file())
         gateway = stage / "opt/vendor/share/work/agent-sec-core/gateway"
-        self.assertTrue((gateway / "github-policy.json").is_file())
+        self.assertTrue((gateway / "github.cedar").is_file())
         gateway_unit = (stage / "srv/units/agent-sec-gateway.service").read_text()
         self.assertIn(
             "-s /opt/vendor/share/work/agent-sec-core/gateway/asc_gateway_addon.py",
@@ -505,9 +560,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue((stage / "etc/agent-sec/skillsec.json").is_file())
         self.assertTrue((stage / "usr/share/suite/agent-sec-core/LICENSE").is_file())
         self.assertTrue(
-            (
-                stage / "usr/share/suite/agent-sec-core/gateway/github-policy.json"
-            ).is_file()
+            (stage / "usr/share/suite/agent-sec-core/gateway/github.cedar").is_file()
         )
         self.assertTrue(
             (stage / "usr/lib/systemd/system/agent-sec-gateway.service").is_file()
@@ -650,7 +703,7 @@ class DeliveryTests(unittest.TestCase):
     def test_each_group_preflights_its_inputs_before_any_write(self):
         for group, name in (
             ("core", "v2/bin/agent-sec-daemon"),
-            ("core", "gateway/github-policy.json"),
+            ("core", "gateway/github.cedar"),
             ("plugins", "openclaw-plugin/dist/index.js"),
             ("skills", "skills/demo/SKILL.md"),
         ):

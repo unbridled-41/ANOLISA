@@ -315,10 +315,12 @@ fi
 %dir %{_datadir}/anolisa/sec-core/gateway
 %{_datadir}/anolisa/sec-core/gateway/asc_gateway_addon.py
 %{_datadir}/anolisa/sec-core/gateway/asc_gateway_policy.py
-%{_datadir}/anolisa/sec-core/gateway/github-policy.json
+%{_datadir}/anolisa/sec-core/gateway/github.cedar
 %{_datadir}/anolisa/sec-core/gateway/mitmproxy.provenance
 %attr(0755,root,root) %{_datadir}/anolisa/sec-core/gateway/install-mitmproxy.sh
 %dir %{_sysconfdir}/agent-sec
+%dir %attr(0755,root,root) %{_sysconfdir}/agent-sec/sandbox
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/agent-sec/sandbox/permissions.json.template
 %config(noreplace) %attr(0600,root,root) %{_sysconfdir}/agent-sec/skillsec.json
 %license LICENSE
 
@@ -403,6 +405,9 @@ rm -rf $RPM_BUILD_ROOT
 make install-all-for-rpmbuild-v2 DESTDIR=$RPM_BUILD_ROOT
 
 %changelog
+* Wed Nov 11 2026 Shirong Hao <shirong@linux.alibaba.com> - 1.2.1-1
+- Update version to 1.2.1
+
 * Fri Nov 06 2026 Shirong Hao <shirong@linux.alibaba.com> - 1.2.0-1
 - Update version to 1.2.0
 

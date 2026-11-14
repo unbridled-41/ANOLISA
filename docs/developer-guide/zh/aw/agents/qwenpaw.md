@@ -10,7 +10,11 @@
 通过 QwenPaw 初始化模型配置。其他版本沿用插件、middleware 与原生任务生命周期接口检查，
 AW 记录已安装版本。示例
 使用 `argv: [qwenpaw, app]`。将 `QWENPAW_WORKING_DIR` 指向已初始化的绝对目录。
-AW 只添加自身临时插件，保留已有插件和原生配置，App 退出后删除自身插件。
+普通启动识别 pip／uv 生成的绝对路径标准启动脚本，包括 uv 可重定位入口后，
+从私有临时包通过原生 Registry 注册 AW，
+减少文件系统插件加载后的全局模块扫描，并保持工作区插件目录原样。AW 负责该集成及其
+退出清理，QwenPaw 的文件系统插件列表不展示该集成。自定义入口、`--reloadable` 和外部
+启动集成继续使用原生插件加载器。
 
 普通启动会检查每个已构造 Agent 实际安装的 resident middleware，并创建已确认的
 任务作用域。Before 正序执行、After 逆序展开，原生工具并发由宿主决定。Offload 工具
@@ -58,6 +62,31 @@ QWENPAW_WORKING_DIR=/absolute/qwenpaw-home target/debug/aw run \
 零 Provider、零事件步骤的普通配置也会安装 resident 准入与清理 middleware。
 
 共用的 sec-core Provider 还提供[加载前 Skill 校验](../providers/sec-core.md#加载前校验-skill)。在 `tool.before` 为原生 `Skill` 工具配置 `check_skill`，并在 daemon 授权实际规范化来源目录。
+
+AW 按 Python 语法树识别标准 CLI 入口，允许安装器的注释、引号和格式差异；
+uv 可重定位入口使用脚本实际目录中的解释器。探测和受管启动复用该识别结果，
+使用同一解释器与导入路径读取实际安装包的字面量版本，避免为版本探测加载 App 配置。
+自定义入口和动态版本继续使用
+原生 `--version`，共用五秒预算。原生 Hook 安装与就绪检查沿用原生接口。受管启动在同一
+解释器、同一进程内执行原启动脚本，保留原参数和导入优先级；用户插件沿用原生加载与
+隔离机制。Startup 回执确认前到达的请求最多等待 30 秒，再开始构造 Agent。等待边界在
+原启动脚本执行前安装，覆盖首次插件加载前 Hub 初始化期间到达的请求；Agent 构造还须
+通过 resident middleware 实际安装检查。AW 模块在原生插件初始化阶段、
+Agent 加载前导入。初始化失败会停止 App，回执缺失或不匹配时阻止 Agent 构造。
+
+## 分开统计 HTTP 启动与首个受保护操作
+
+分别统计启动到 HTTP、HTTP 到 Agent 就绪，以及首个 Hook 的延迟。HTTP 监听可以早于
+Agent 和插件启动完成，监听可用本身不代表已经能够处理受保护请求。
+
+部署使用 [sec-core 首用等待](../providers/sec-core.md#重叠后端与-agent-启动)时，
+外部 supervisor 可以解除 App 启动对后端健康的前置依赖。CPU 受限的容器可在 HTTP
+可用后启动扫描预热，减少与 App 前期导入争抢 CPU，也可在首用时初始化能力。
+只预热活动策略引用的能力。HTTP 启动由此独立于后端就绪；必需 Hook 安装、策略准入
+和实际检查仍在受保护模型请求或工具操作前完成。按该里程碑启动后端或预热由 supervisor
+负责，`aw run` 不调度或管理这些外部进程。
+如果 App 初始化本身会触发受保护操作，应独立启动后端，避免该操作等待后端、后端又
+等待 HTTP 的循环依赖。此时只后置主动扫描预热，首次实际检查仍初始化所需能力。
 
 ## 保留原生 App 启动命令
 

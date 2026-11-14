@@ -59,8 +59,9 @@ responsible for its lifecycle and correlation with the chosen Provider instance.
 The description declares up to 64 operations and their supported events and
 effects. Operation names must be nonempty and unique. A declaration is supplied by the Provider; it
 cannot expand the Adapter's trusted capabilities or establish runtime identity.
-The vocabulary recognizes all 16 configuration events, while this admission
-profile permits `input.submit`, `tool.before` and `tool.after`.
+The vocabulary recognizes all 16 configuration events. Provider execution
+currently admits `input.submit`, `tool.before`, `tool.after` and
+`security.violation` when the selected Adapter supports the event and effect.
 Submission support requires a supported resident entrypoint such as Qoder SDK, QwenPaw or Pi.
 
 An operation may restrict an event to specific Adapter IDs with optional
@@ -95,8 +96,9 @@ An invocation supplies the configured operation, private configuration,
 configuration revision, remaining budget, admitted effects, normalized event and
 an opaque input digest. A checked successful response returns that same digest
 and a list of candidate effects. An empty list imposes no additional restriction;
-`observe` requests observation and `block` requests prevention of the pending
-submission or tool call. Both are candidate effects; the library itself writes no audit record.
+`observe` requests observation. `block` rejects a pending submission or tool
+call, or withholds a final tool result at an Adapter boundary that supports
+`security.violation`. Both are candidate effects; the library itself writes no audit record.
 None of these responses grants native permission.
 `Outcome::requests_block()` reports only whether that candidate effect is present.
 
@@ -169,12 +171,13 @@ preserved; admission does not schedule distinct events or choose parallelism.
 | Request | Admission result |
 | --- | --- |
 | `input.submit`: `observe`, `block` | Accepted with Provider and Adapter support; tool selectors and raw native-hook steps are rejected |
-| `tool.before`: `observe`, `block` | Accepted when the selected operation and Adapter both support every requested effect |
+| `tool.before`: `observe`, `block`, `replace_input` | Accepted when the selected operation and Adapter both support every requested effect |
 | `tool.after`: `observe` | Accepted when both sides support it |
 | `tool.after`: `replace_result` | One structured step with trusted text-replacement capability |
-| `ask`, input replacement or a block after execution | Rejected |
-| An enabled event outside submission and the two tool events | Rejected, including when `required: false` |
-| A guard such as `security.violation` | Rejected; final-check ordering is not implemented by this profile |
+| `security.violation`: `observe`, `block` | Accepted for the DeepSeek Harness final-result boundary when both sides support it |
+| `ask` or `tool.after` block | Rejected |
+| An enabled event without Adapter support | Rejected, including when `required: false` |
+| `events.tool.before.guard` configuration field | Rejected by runtime admission; configure pre-execution checks as `tool.before` steps |
 | Event and step `match.tools` | Accepted; the Host invokes only tools matching both selectors |
 | A guarantee beyond `native_hook` | Rejected |
 | A missing Provider, operation, capability or matching configuration validation | Rejected with an explicit reason |
@@ -268,7 +271,7 @@ reject unsupported projections/effects rather than ignoring them.
 
 ### Tokenless composition
 
-PreTool returns complete retry suggestions through `block`; each new call passes security and native permissions again. PostTool replaces only authorized text slots.
+PreTool can return one `replace_input` effect with an object `input` retaining every original argument key. It must be the first applicable before step and its sole effect; every before step uses `on_error: block`. Later checks see the candidate and the last successful callback publishes it under the same identity and budget, preserving native authorization. Legacy `block` retry suggestions remain supported. PostTool replaces only authorized text slots. SDK-managed MCP handler input replacement is rejected before checking the candidate; unchanged MCP calls and PostTool processing keep their existing routes.
 See the [Tokenless reference](tokenless.md) for RTK ownership, result classification and telemetry.
 Current recovery capability is `none`; Schema/BeforeModel and Retrieve seams are not available.
 See [Core execution](../../../../../src/aw/docs/design/en/core-execution.md) for the separate plan API contract.

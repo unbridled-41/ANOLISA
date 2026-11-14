@@ -113,10 +113,7 @@ pub(super) fn run(args: &Arguments) -> Result<Exit> {
         Instant::now() + Duration::from_secs(if action == "open" { 30 } else { 5 })
     };
     let input = hook::read_input(deadline)?;
-    let client = Client::connect(&root.socket, deadline)?;
-    if client.identity() != &root.binding.identity {
-        return Err("stale SDK host binding".into());
-    }
+    let client = Client::from_identity(&root.socket, root.binding.identity.clone());
     if action == "ready" {
         let ready: Ready = serde_json::from_slice(&input)?;
         if !resident_policy || ready.pid != owner_pid {
@@ -231,6 +228,32 @@ pub(super) fn run(args: &Arguments) -> Result<Exit> {
         return Err("SDK task handle does not belong to this host".into());
     }
     match action {
+        "activate" => {
+            // Keep the handoff, invocation gate and watch on one bounded transport.
+            client.call(
+                Operation::AcknowledgeScope {
+                    instance_id: scope.binding.instance_id.clone(),
+                },
+                deadline,
+            )?;
+            let invocations = client.call(
+                Operation::EnableInvocations {
+                    instance_id: scope.binding.instance_id.clone(),
+                },
+                deadline,
+            )?;
+            let watch = client.call(
+                Operation::WatchScope {
+                    instance_id: scope.binding.instance_id,
+                    pid: owner_pid,
+                },
+                deadline,
+            )?;
+            serde_json::to_writer(
+                std::io::stdout().lock(),
+                &serde_json::json!({"invocations": invocations, "watch": watch}),
+            )?;
+        }
         "watch" => {
             let result = client.call(
                 Operation::WatchScope {

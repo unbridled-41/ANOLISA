@@ -284,13 +284,16 @@ sandbox 会话还有一层独立策略：默认 sandbox 不开放记忆工具，
 | `mem_write` | `path`、`content` | `overwrite` | `wrote N bytes to <path>` |
 | `mem_append` | `path`、`content` | — | `appended N bytes to <path>` |
 | `mem_edit` | `path`、`old_str`、`new_str` | — | `edited <path>`（`old_str` 须唯一命中） |
-| `mem_list` | — | `dir`、`recursive`、`glob` | `{name, type, size, mtime}` 数组，上限 5000 条（截断时在日志中告警） |
+| `mem_list` | — | `dir`、`recursive`、`glob` | `{name, type, size, mtime}` 数组，上限 5000 条（仅在省略额外匹配条目时写入日志告警；恰好 5000 条不告警） |
 | `mem_grep` | `pattern` | `dir`、`type`、`max`、`case_insensitive` | `{path, line, text}` 数组 |
 | `mem_diff` | `path1`、`path2` | — | unified diff |
 | `mem_mkdir` | `path` | — | `created <path>` |
 | `mem_remove` | `path` | `recursive` | `removed <path>` |
 | `mem_promote` | `session_path`、`store_path` | — | 把会话 scratch 文件复制到持久化仓的新文件 |
 | `mem_session_log` | — | — | 当前会话 JSONL |
+
+`mem_grep` 跳过含非法 UTF-8 字节的行，继续搜索同一文件的后续行。
+返回的行号从 1 开始，按原文件中的位置计算，包含被跳过的行。
 
 `mem_write(overwrite=false)` 和 `mem_promote` 拒绝覆盖已有目标。写入失败时，会删除
 本次创建的不完整文件，以便重试同一请求；清理失败会与写入错误一起报告。这不是原子发布：
@@ -347,9 +350,21 @@ procfs 和容纳完整新内容的空闲空间。临时文件位于 `.anolisa/` 
 `mem_revert` 仅从 HEAD 恢复指定文件的工作区内容，保持 Git 历史和暂存区不变（包括该文件已暂存的修改），返回恢复来源的 HEAD 哈希。因此，之后若不重新暂存就手动提交，仍可能提交恢复前的暂存区内容；若希望提交恢复后的文件，请显式重新暂存该文件。其他文件仍可单独撤销。此行为不受 `memory.git.auto_commit` 开关影响；普通写入工具保留原有的自动提交行为。
 
 快照恢复会保留只读目录的权限模式。失败尝试的解包暂存目录会被清理，重试前
-也会清理残留暂存内容。原有 live 内容保留在 `.anolisa/trash/` 中供恢复，并
-保留原权限；手动清理只读目录时，可能需要先恢复所有者写权限。快照恢复不会
-自动回收这些保留内容。
+也会清理残留暂存内容。每次成功恢复都会将原有 live 内容保存在
+`.anolisa/trash/` 下的独立目录中，并保留原权限；同一秒内重复恢复同一快照
+也不会复用或覆盖已有恢复目录。如果 trash 创建或移动失败，尚未迁移的旧数据
+会留在本次操作的 `.anolisa/.<id>.rollback.<timestamp>[-<suffix>]/` 目录中，
+警告会指出保留路径。如果无法分配 rollback 目录，恢复会在移动 live 文件前
+失败。旧版 rollback 残留原地保留，不会阻塞新恢复。快照恢复不会自动删除
+保留的 trash 或 rollback 数据。手动清理只读目录时，可能需要先恢复所有者写权限。
+
+恢复与快照回收通过挂载级锁在多个 `serve` 进程之间互斥。锁被占用时，恢复会在
+修改文件前返回 `another snapshot restore or reclaim is in progress`；请等待当前
+操作结束后重试。回收无法取得锁时，会跳过本次挂载打开时的清扫。
+持锁进程退出时锁会释放，但 `.anolisa/.restore.lock` 文件会保留：任何进程仍在使用
+该挂载时，都不要删除这个文件。升级后请重启共享挂载的全部 `serve` 进程，因为
+旧版本不会遵守此锁。互斥范围覆盖恢复与回收；若需要恢复后的文件树保持不变，
+请同时暂停其他文件写入方。
 
 ### 主权与导入导出（13 个）
 
@@ -404,6 +419,22 @@ procfs 和容纳完整新内容的空闲空间。临时文件位于 `.anolisa/` 
 如果无法遍历目录，或无法将 Markdown 文件读取为 UTF-8 文本，`mem_export` 会返回包含相关路径的错误，不会将不完整的 AMA 归档作为成功结果返回。请检查文件权限或编码后重试。按类别或来源筛选时仍需读取元数据，因此读取失败也可能阻止筛选导出。元数据目录和非 Markdown 文件仍不参与导出。
 
 Rust API 调用者使用 `ExportFilter.include_tasks = false` 时，会在遍历或读取前排除 `tasks/` 子树，因此不可读的任务目录或文件不会阻止所请求的导出。MCP `mem_export` 工具包含任务，并继续报告这些任务的读取或遍历错误。
+
+`mem_import` 会在 `overwrite` 清空已有 Markdown 文件之前检查记忆和任务路径。
+空路径、非 Markdown 路径、重复路径、绝对路径、遍历路径、保留路径及符号链接路径
+会使本次导入跳过整库清空。合法条目仍逐项导入，也会替换同路径文件；非法条目列入
+错误列表。`dry_run=true` 只执行校验，不写入，也不创建备份。
+对于合法归档的覆盖导入，将被清空的普通 Markdown 文件可以转换为目录，例如将
+`notes/old.md` 转换为目录以导入 `notes/old.md/new.md`。预览也会考虑这类转换；
+符号链接祖先路径仍会被拒绝。
+
+对合法归档执行清空之前，`overwrite` 会将 AMA 备份保存到
+`<mount>/.anolisa/import-backup-<ULID>.json`，仅文件所有者可读。
+导出、写入或同步失败会在清空和导入之前中止。备份与清空成功后，返回结果包含
+`Backup:` 路径。若要恢复缺失的记忆，请在宿主机上读取该文件，将内容作为 `json_data`
+传给 `mem_import`，并使用 `strategy="skip-existing"`；已有路径不会被替换。
+备份会一直保留，直到手动删除。这不提供自动回滚：后续写入失败仍可能留下部分导入
+结果。执行覆盖导入时请暂停其他写入方，以保持备份与导入状态一致。
 
 ### 错误码语义
 
@@ -483,7 +514,13 @@ MEMORY_GIT_ENABLED=true MEMORY_GIT_AUTO_COMMIT=true agent-memory
 
 ### 全文搜索
 
-SQLite FTS5 BM25 索引，亚毫秒级查询。后台 tokio 任务通过 `inotify` 监听 mount，事件经 200 ms debounce 聚合后在单事务中应用。分词器用 `trigram`（对 ≥3 字符的子串匹配友好）。trigram 分词器以 3 字符滑窗生成 token，因此少于 3 字符的查询词（如中文的"花名""小云"）不产生任何 token，本会静默命中为空；`memory_search` 会识别这种情况并回退到 `body LIKE '%term%'` 子串扫描，确保短 CJK 查询仍能召回。`IN_Q_OVERFLOW` 时自动触发全量 rescan，不静默丢事件。
+SQLite FTS5 BM25 索引。后台线程通过 `inotify` 监听 mount，事件经 200 ms debounce 聚合，每个文件的索引更新在事务中完成。分词器用 `trigram`（对 ≥3 字符的子串匹配友好）。trigram 分词器以 3 字符滑窗生成 token，因此少于 3 字符的查询词（如中文的"花名""小云"）不产生任何 token，本会静默命中为空；`memory_search` 会识别这种情况并回退到 `body LIKE '%term%'` 子串扫描，确保短 CJK 查询仍能召回。`IN_Q_OVERFLOW` 时自动触发全量 rescan。
+
+启动或增量更新期间的索引写入失败会触发自动重扫；连续失败时，重试间隔从 1 秒
+逐步翻倍，最大为 64 秒。恢复无需再次修改文件或重启服务。已知失败尚未恢复时，
+`memory_search` 会报告 `search index is incomplete`，不会将空结果或不完整结果
+作为成功返回。恢复后重试搜索，或通过 `mem_grep` 直接检索文件。若错误持续，
+检查 index worker 告警中的失败路径与数据库错误；记忆文件仍可通过文件工具访问。
 
 索引仅收录不超过 4 MiB、格式受支持的 UTF-8 文本文件。已索引的文件超过此限制或变为非 UTF-8 后，旧的文本和向量条目会被移除并记录日志，文件本身不变。默认 16 MiB 写入限制和单次追加限制不保证文件可被索引：多次追加仍可能使文件超过 4 MiB。请将大型记忆拆分为较小文件以保持可检索。
 
@@ -576,7 +613,13 @@ min_artifact_age_secs = 86400
 
 启用 reclaim 后，挂载打开时的清扫还会删除 `.anolisa/snapshots/` 下超过保留时长的崩溃残留：不完整的 `*.partial` 归档、缺 sidecar 的归档、缺归档的 sidecar，以及 restore 中断遗留的隐藏 `.<id>.staging` 目录。崩溃 restore 的 staging 目录包含整棵挂载树拷贝，因此 reclaim 也是防止该故障模式吃满磁盘的机制。
 
-清扫还会修复损坏的 sidecar：当其归档结构完整（gzip 流完整，且所有条目均通过 restore 提取前运行的同一套检查：仅含普通文件与目录条目、无 `..` 路径穿越、无重名文件条目、无文件落在已提取路径上的冲突）时，从归档自身的元数据重新生成 sidecar。未通过这些检查的归档同样会被 restore 拒绝，因此会被直接删除，而不是被修复成一个永远无法 restore 的快照。修复本身会把替换内容暂存为归档旁边的隐藏 `.memory-write-*.tmp` 文件；修复中途被强杀遗留的此类文件会在超过保留时长后被后续清扫删除。
+清扫还会修复损坏的 sidecar：当其归档结构完整（gzip 流完整，且所有条目均通过 restore 提取前运行的同一套检查：仅含普通文件与目录条目、无 `..` 路径穿越、无重名文件条目、无文件落在已提取路径上的冲突）时，从归档自身的元数据重新生成 sidecar。即使 sidecar 可以正常解析，归档超过保留时长后也会接受这些检查。无效归档会被删除，并在清扫汇总中单独计数；其 sidecar 超过自身保留时长后也会被删除。有效的快照对会被保留，元数据不会被重写。这项校验会在挂载打开时完整读取每个符合年龄条件的归档。
+
+如果归档打开或读取失败，清扫会保留归档及其 sidecar，记录警告并计入校验失败次数。权限或存储访问失败不能证明归档损坏；恢复访问后，可重新打开挂载以重试校验。
+
+`mem_snapshot_list` 会排除没有普通归档文件的条目，但不会执行完整性校验。名为 `<id>.tar.gz` 的目录不能使超龄 sidecar 一直保留：清扫会在 sidecar 超过保留时长后将其删除，并保留目录及其内容。
+
+修复本身会把替换内容暂存为归档旁边的隐藏 `.memory-write-*.tmp` 文件；修复中途被强杀遗留的此类文件会在超过保留时长后被后续清扫删除。
 
 ### 环境变量
 

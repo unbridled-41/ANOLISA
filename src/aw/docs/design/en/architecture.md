@@ -7,6 +7,15 @@ callbacks, the local service manages bindings and events, the Host invokes
 Providers, and the Adapter returns results to the Agent. The Agent owns model
 calls, tool scheduling, and permission approval.
 
+DeepSeek Harness adds a launch-scoped plugin for submission and tool events.
+For `security.violation`, the Adapter also installs a Node preload in the Agent
+process. The pinned Agent loop awaits the final Provider decision after native
+result finalization and before Session commit. The preload is removed from
+inherited `NODE_OPTIONS` after registration, and Providers use the original
+launch environment. This path covers the verified headless top-level tool
+delivery on DSH `0.2.1-rc.5`; see [Adapter dispatch](adapters/adapter-dispatch.md#native-startup-evidence)
+for its identity, lifecycle and excluded paths.
+
 Resident SDK support uses the service's owned root and per-task child bindings.
 The root policy stays immutable; each task pins its own cwd and environment,
 keeps replay fences until release, and is reclaimed when its owner exits.
@@ -48,7 +57,7 @@ on `aw-service`; tests in `aw-provider` also depend on `aw-config`; CLI integrat
 depend on `aw-cli`. The `aw` frontend calls AW configuration and local-extension APIs in-process.
 The standalone `aw-package` executable has been removed; its crate remains.
 AW CLI builds use `make -C src/aw build`; archive assembly uses
-`make -C distribution aw-packages VERSION=0.1.0 COMPONENTS='core sec-core tokenless' OUTPUT="$PWD/target/aw-packages"` and ordinary scripts under
+`make -C distribution aw-packages VERSION=0.1.1 COMPONENTS='core sec-core tokenless' OUTPUT="$PWD/target/aw-packages"` and ordinary scripts under
 `distribution/packaging/aw/`. Extension records, file verification and durable
 transactions live in the private `aw-package::store` module. Runtime file leases
 live in `aw-exec`, independently of package database access.
@@ -279,6 +288,7 @@ transports lifecycle frames through the existing bridge RPC. See the
 [policy reload contract](runtime/policy-reload.md#qoder-sdk-request-admission).
 
 [Resident SDK lifecycle](adapters/resident-sdk.md) describes per-client task admission, scoped callback routing, fail-close and release for Pi, Claude and ordinary Qoder SDK Queries.
+[Codex CLI Adapter](adapters/codex-adapter.md) uses native command Hooks to run ordered AW steps and checks the original-input boundary before launching a local session.
 
 [Managed Claude MCP handlers](adapters/claude-mcp.md) add an explicit handler source, task-owned invocation identity and success-aware result adoption through the existing Provider path.
 

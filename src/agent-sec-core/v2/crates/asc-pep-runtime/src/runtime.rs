@@ -2,9 +2,9 @@
 
 use crate::{PepError, SandboxBackend, prepare_launch, prepare_path_facts};
 use asc_daemon_protocol::authorization::{
-    AcceptedAuthorization, AgentPrincipal, AuthorizationRequest, CommandRequest, Decision,
-    DecisionVerdict, ExecutionReceipt, ExecutionResult, ExecutionSpec, FileRight, LaunchSpec,
-    NetworkMode, OsPermissionSet, PathFact, ReceiptAck, RequestType, RuleEffect, Validate,
+    AcceptedAuthorization, AgentPrincipal, CommandRequest, Decision, DecisionVerdict,
+    ExecutionReceipt, ExecutionResult, ExecutionSpec, FileRight, LaunchSpec, NetworkMode,
+    OsAuthorizationRequest, OsPermissionSet, PathFact, ReceiptAck, RuleEffect, Validate,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,36 @@ pub trait PermissionProvider {
     /// # Errors
     /// Returns an error when no valid permission request can be prepared.
     fn permissions(&self, launch: &LaunchSpec) -> Result<OsPermissionSet, PepError>;
+
+    /// Binds source constraints before permissions can reach either execution or the PDP.
+    ///
+    /// # Errors
+    /// Rejects invalid permissions, unresolved objects and changed source constraints.
+    fn prepare(&self, launch: &LaunchSpec) -> Result<ExecutionSpec, PepError> {
+        let permissions = self.permissions(launch)?;
+        let path_facts = prepare_path_facts(launch, &permissions, &[])?;
+        self.validate_path_facts(launch, &permissions, &path_facts)?;
+        Ok(ExecutionSpec {
+            version: 1,
+            launch: launch.clone(),
+            permissions,
+            path_facts,
+            mount_aliases: Vec::new(),
+        })
+    }
+
+    /// Checks source-specific constraints against the same object facts retained for execution.
+    ///
+    /// # Errors
+    /// Rejects facts that would widen the prepared permission source.
+    fn validate_path_facts(
+        &self,
+        _launch: &LaunchSpec,
+        _permissions: &OsPermissionSet,
+        _facts: &[PathFact],
+    ) -> Result<(), PepError> {
+        Ok(())
+    }
 }
 
 /// Default provider for an explicit fixed permission set.
@@ -34,7 +64,7 @@ pub trait AuthorizationClient {
     ///
     /// # Errors
     /// Returns transport, malformed response or service errors.
-    fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError>;
+    fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError>;
     /// Records one receipt, without retrying execution.
     ///
     /// # Errors
@@ -51,7 +81,7 @@ pub struct DaemonAuthorizationClient {
 }
 
 impl AuthorizationClient for DaemonAuthorizationClient {
-    fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError> {
+    fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError> {
         match asc_daemon_client::authorization_evaluate(&self.socket, request, self.timeout)
             .map_err(|e| PepError::Authorization(e.to_string()))?
         {
@@ -96,7 +126,7 @@ pub struct PepOutcome {
 #[derive(Clone)]
 pub struct PreparedInvocation {
     /// Data sent to the PDP.
-    pub request: AuthorizationRequest,
+    pub request: OsAuthorizationRequest,
     /// Private execution state pinned during initial preparation.
     execution: ExecutionSpec,
 }
@@ -117,8 +147,9 @@ impl PreparedInvocation {
             Path::new(&launch.cwd),
             launch.env,
         )?;
-        let mut permissions = provider.permissions(&launch)?;
-        let path_facts = prepare_path_facts(&launch, &permissions, &[])?;
+        let prepared = provider.prepare(&launch)?;
+        let mut permissions = prepared.permissions;
+        let path_facts = prepared.path_facts;
         let mount_aliases = permissions
             .filesystem
             .rules
@@ -130,6 +161,7 @@ impl PreparedInvocation {
                     .any(|f| f.path == rule.path && f.path != f.canonical_path)
             })
             .map(|rule| rule.path.clone())
+            .chain(prepared.mount_aliases)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -146,14 +178,15 @@ impl PreparedInvocation {
                 .ok_or_else(|| PepError::Protocol("missing requested path identity".into()))?;
             path.clone_from(&fact.canonical_path);
         }
-        let request = AuthorizationRequest {
-            request_type: RequestType::Os,
-            request_id: uuid::Uuid::new_v4().to_string(),
-            execution_id: uuid::Uuid::new_v4().to_string(),
-            principal: principal.clone(),
-            launch: CommandRequest::from(&launch),
-            requested_permissions: permissions.clone(),
-        };
+        let request = OsAuthorizationRequest::new(
+            uuid::Uuid::new_v4().to_string(),
+            asc_daemon_protocol::authorization::OsAuthorizationContext {
+                execution_id: uuid::Uuid::new_v4().to_string(),
+                agent: principal.clone(),
+                launch: CommandRequest::from(&launch),
+                requested_permissions: permissions.clone(),
+            },
+        );
         request.validate()?;
         Ok(Self {
             request,
@@ -259,7 +292,11 @@ impl PepRuntime {
                 )));
             }
         }
-        verify_ceiling(permissions, &prepared.request.requested_permissions, &facts)?;
+        verify_ceiling(
+            permissions,
+            &prepared.request.context.requested_permissions,
+            &facts,
+        )?;
         let caps = self.backend.capabilities()?;
         if !caps.strict_filesystem
             || (!permissions.execution.deny_paths.is_empty() && !caps.noexec)
@@ -345,7 +382,7 @@ impl PepRuntime {
 
     fn apply_at(
         &mut self,
-        request: &AuthorizationRequest,
+        request: &OsAuthorizationRequest,
         decision: Decision,
         spec: Result<ExecutionSpec, PepError>,
         client: &dyn AuthorizationClient,
@@ -441,16 +478,16 @@ fn now() -> Result<u64, PepError> {
 }
 
 fn verify_binding(
-    request: &AuthorizationRequest,
+    request: &OsAuthorizationRequest,
     decision: &Decision,
     time: u64,
 ) -> Result<(), PepError> {
     if decision.decision_id.is_empty()
         || decision.policy_version.is_empty()
         || decision.request_id != request.request_id
-        || decision.execution_id != request.execution_id
-        || decision.principal != request.principal
-        || (decision.launch != request.launch
+        || decision.execution_id != request.context.execution_id
+        || decision.principal != request.context.agent
+        || (decision.launch != request.context.launch
             && !matches!(
                 decision.verdict,
                 DecisionVerdict::Modify | DecisionVerdict::StepUp
@@ -481,6 +518,26 @@ fn verify_ceiling(
             return Err(PepError::Authorization(
                 "effective permissions removed requested noexec".into(),
             ));
+        }
+    }
+    for denied in requested
+        .filesystem
+        .rules
+        .iter()
+        .filter(|rule| rule.effect == RuleEffect::Deny)
+    {
+        // Logical default-deny equivalence does not preserve hardlink checks.
+        if !denied.rights.iter().all(|right| {
+            effective.filesystem.rules.iter().any(|rule| {
+                rule.effect == RuleEffect::Deny
+                    && rule.path == denied.path
+                    && (rule.rights.contains(right) || rule.rights.contains(&FileRight::Read))
+            })
+        }) {
+            return Err(PepError::Authorization(format!(
+                "effective permissions removed requested exclusion at {}",
+                denied.path
+            )));
         }
     }
     let kinds: BTreeMap<_, _> = facts

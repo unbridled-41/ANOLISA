@@ -39,11 +39,30 @@ and one response; a frame is limited to 8 MiB. Native stdin and normalized event
 a separate 1 MiB limit; the frame accounts for JSON byte-array expansion.
 
 A request contains `api_version`, `identity`, `deadline_ns` and `operation`.
+`Client::connect_with_status` returns the authenticated discovery status with
+the retained client. Service adoption checks the revision, PID and audit health
+from that response without issuing another Status RPC. It is a snapshot at
+discovery time; subsequent calls still validate the retained identity.
+
 The initial `status` request may omit identity. Every subsequent request must
 match the service's fresh generation and the SHA-256 revision of its original
 configuration bytes. Restarting the service invalidates existing clients and
 handles, even when the file is unchanged. Editing the file does not reload a
 running service.
+
+`Client::connect` discovers an unknown service identity. Callback transports
+with an already-issued binding use `Client::from_identity` to retain that
+identity without an extra Status exchange. Construction performs no I/O;
+every operation still checks the Unix peer, protocol, generation, configuration
+and deadline. A stale binding fails without rediscovery or automatic retry.
+
+The shared JavaScript and Python Scope transports acknowledge the installed
+native routes, enable invocations and obtain the watch revision through one
+`aw scope --action activate` child. The service operations retain their order
+and share the CLI's five-second deadline. The native owner checks its seams
+before and after activation and closes the child scope on failure, including
+a lost response after acknowledgement. The individual scope actions remain
+available to existing callers.
 
 | `operation.method` | Input beyond the envelope | Result |
 | --- | --- | --- |
@@ -376,6 +395,12 @@ launcher chooses `$XDG_RUNTIME_DIR/aw/<revision-prefix>` or
 supplied runtime directory must already be private and owned by the current user.
 The path uses a shortened revision to fit a Unix socket; reuse still verifies
 the entire configuration revision.
+
+The service validates its startup document once and passes that immutable
+configuration to resource-limit and evidence-source initialization. Evidence
+validation and public audit projection share the same process-wide compiled
+contract registry. New bindings and policy updates retain their own document
+validation and Provider admission; no readiness or policy result is cached.
 
 Startup holds a private per-state lock and writes an immutable configuration
 snapshot. A new service runs in a separate session with null stdin/stdout and a

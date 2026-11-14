@@ -1,9 +1,10 @@
-//! Daemon-only task-to-Cedar proposals; every outcome is an unapproved candidate, never an
-//! approval.
+//! Task- and command-to-Cedar proposals through the daemon plus local rule-to-Cedar init; every
+//! outcome is an unapproved candidate, never an approval.
 
+mod command;
 mod render;
 
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -19,6 +20,7 @@ use asc_daemon_protocol::{
     },
     method::INTENT_PROPOSE,
 };
+use asc_intent::{IntentSpec, compile_spec};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
@@ -42,7 +44,16 @@ impl Drop for Interrupt {
 pub(crate) enum IntentCommand {
     /// Generates a direct Cedar candidate; only the task text is sent to the configured model.
     Propose(Propose),
+    /// Derives the Cedar a single hook-observed command needs; sends only command and cwd.
+    ProposeCommand(command::ProposeCommand),
+    /// Generates validated Cedar locally from explicit rules; no daemon, model or network.
+    Init(Init),
 }
+
+/// Local init output budget for a spec file read from disk or stdin.
+const SPEC_FILE_BYTES: usize = 256 * 1024;
+/// Version of the local init JSON output; it is a preview, not a candidate.
+const INIT_VERSION: &str = "asc.intent.init.v1";
 
 #[derive(Debug, Args)]
 pub(crate) struct Propose {
@@ -64,15 +75,74 @@ enum Format {
     Cedar,
 }
 
+/// Explicit allow/deny rules compiled to Cedar on this host; forbid takes precedence over
+/// permit, and anything no permit names stays denied by default.
+#[derive(Debug, Args)]
+pub(crate) struct Init {
+    /// Path granted file.read; repeatable. A trailing /* or /** grants the whole subtree.
+    #[arg(long, value_name = "PATH")]
+    allow_read: Vec<String>,
+    /// Path granted file.write; repeatable. A trailing /* or /** grants the whole subtree.
+    #[arg(long, value_name = "PATH")]
+    allow_write: Vec<String>,
+    /// Executable path granted file.exec; repeatable.
+    #[arg(long, value_name = "PATH")]
+    allow_exec: Vec<String>,
+    /// Path denied file.read, carving an exception out of broader allows; repeatable.
+    #[arg(long, value_name = "PATH")]
+    deny_read: Vec<String>,
+    /// Path denied file.write; repeatable.
+    #[arg(long, value_name = "PATH")]
+    deny_write: Vec<String>,
+    /// Executable path denied file.exec; repeatable.
+    #[arg(long, value_name = "PATH")]
+    deny_exec: Vec<String>,
+    /// Grant network.use for the whole network; the schema has no endpoint granularity.
+    #[arg(long)]
+    allow_network: bool,
+    /// Deny network.use for the whole network.
+    #[arg(long, conflicts_with = "allow_network")]
+    deny_network: bool,
+    /// Restrict read/write rules to this requesting program; repeatable, exact paths only.
+    #[arg(long, value_name = "PATH")]
+    program: Vec<String>,
+    /// JSON spec file, or - for stdin; mutually exclusive with the rule flags.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "allow_read", "allow_write", "allow_exec",
+            "deny_read", "deny_write", "deny_exec",
+            "allow_network", "deny_network", "program",
+        ],
+    )]
+    spec_file: Option<String>,
+    /// Output format; printed Cedar is a local preview, never an approval.
+    #[arg(long, value_enum, default_value_t = InitFormat::Cedar)]
+    format: InitFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum InitFormat {
+    Cedar,
+    Json,
+}
+
 /// Redacted intent failures without task text, file contents or raw transport errors.
 #[derive(Debug, thiserror::Error)]
 pub enum IntentFailure {
     /// Task, transport or output size exceeds its budget.
     #[error("intent input exceeds its budget; shorten the task text")]
     Limit,
+    /// Local spec input or generation failed; the message names the offending input.
+    #[error("{0}")]
+    Spec(String),
     /// The candidate had already expired when it was received.
     #[error("{0}")]
     Clarification(&'static str),
+    /// A command proposal was rejected locally; no request reached the daemon.
+    #[error("invalid command proposal: {0}")]
+    Input(&'static str),
     /// Local daemon transport failed; no local fallback is enabled.
     #[error("intent daemon transport failed; no candidate or local fallback")]
     Transport,
@@ -99,7 +169,7 @@ impl IntentFailure {
     /// Returns 2 for clarification, 130 for interruption and 1 for other execution errors.
     pub const fn exit_code(&self) -> u8 {
         match self {
-            Self::Clarification(_) => 2,
+            Self::Clarification(_) | Self::Input(_) => 2,
             Self::Interrupted => 130,
             _ => 1,
         }
@@ -114,14 +184,93 @@ impl From<io::Error> for IntentFailure {
 
 impl IntentCommand {
     pub(crate) fn run(&self, socket: &Path, timeout: Duration) -> Result<u8, IntentFailure> {
-        let Self::Propose(options) = self;
         let interrupted = Arc::new(AtomicBool::new(false));
         let signal = Interrupt::register(Arc::clone(&interrupted))?;
-        let result = options.run(socket, timeout, &interrupted);
+        let result = match self {
+            Self::Propose(options) => options.run(socket, timeout, &interrupted),
+            Self::ProposeCommand(options) => options.run(socket, timeout, &interrupted),
+            // Init is a pure local computation, so it needs neither the socket nor an
+            // interruptible wait.
+            Self::Init(options) => options.run(),
+        };
         drop(signal);
         check_interrupt(&interrupted)?;
         result
     }
+}
+
+impl Init {
+    fn run(&self) -> Result<u8, IntentFailure> {
+        let spec = self.spec()?;
+        let artifact = compile_spec(&spec)
+            .map_err(|error| IntentFailure::Spec(render::escape(&error.to_string())))?;
+        let mut out = io::stdout().lock();
+        match self.format {
+            InitFormat::Cedar => {
+                writeln!(
+                    out,
+                    "// LOCAL: generated by intent init; not approved, not effective."
+                )?;
+                // Spec validation rejects control characters, bidi controls and line or paragraph
+                // separators, so the fixed template keeps its line breaks in terminals and exports.
+                writeln!(out, "{}", artifact.text)?;
+            }
+            InitFormat::Json => {
+                let value = serde_json::json!({
+                    "format_version": INIT_VERSION,
+                    "spec": spec,
+                    "policy": artifact.text,
+                    "schema_sha256": artifact.schema_sha256,
+                });
+                serde_json::to_writer(&mut out, &value).map_err(|_| IntentFailure::Output)?;
+                writeln!(out)?;
+            }
+        }
+        out.flush()?;
+        Ok(0)
+    }
+
+    fn spec(&self) -> Result<IntentSpec, IntentFailure> {
+        let Some(path) = &self.spec_file else {
+            return Ok(IntentSpec {
+                allow_read: self.allow_read.clone(),
+                allow_write: self.allow_write.clone(),
+                allow_exec: self.allow_exec.clone(),
+                deny_read: self.deny_read.clone(),
+                deny_write: self.deny_write.clone(),
+                deny_exec: self.deny_exec.clone(),
+                allow_network: self.allow_network,
+                deny_network: self.deny_network,
+                programs: self.program.clone(),
+                ..IntentSpec::default()
+            });
+        };
+        let raw = read_spec_source(path).map_err(|error| {
+            IntentFailure::Spec(render::escape(&format!(
+                "cannot read spec file {path}: {error}"
+            )))
+        })?;
+        if raw.len() > SPEC_FILE_BYTES {
+            return Err(IntentFailure::Spec(
+                "spec file exceeds its size budget".into(),
+            ));
+        }
+        serde_json::from_str(&raw)
+            .map_err(|error| IntentFailure::Spec(render::escape(&format!("invalid spec: {error}"))))
+    }
+}
+
+fn read_spec_source(path: &str) -> io::Result<String> {
+    let mut buffer = String::new();
+    let limit = SPEC_FILE_BYTES as u64 + 1;
+    if path == "-" {
+        io::stdin().lock().take(limit).read_to_string(&mut buffer)?;
+    } else {
+        std::fs::File::open(path)?
+            .take(limit)
+            .read_to_string(&mut buffer)?;
+    }
+    Ok(buffer)
 }
 
 impl Propose {

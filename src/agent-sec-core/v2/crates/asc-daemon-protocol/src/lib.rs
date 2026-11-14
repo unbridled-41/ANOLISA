@@ -10,7 +10,8 @@
 
 pub mod authorization;
 pub use authorization::{
-    AuthorizationRequest, ClaimResponse, Decision, DecisionClaim, ExecutionReceipt, ReceiptAck,
+    AuthorizationRequest, ClaimResponse, Decision, DecisionClaim, ExecutionReceipt,
+    OsAuthorizationRequest, ReceiptAck,
 };
 
 mod action;
@@ -33,7 +34,7 @@ mod response;
 pub use action::{CodeScanParams, PiiScanParams, PromptScanParams, PromptScanWarmupParams};
 pub use common::{ListParams, ListResult, ResourceParams, RevisionParams};
 pub use envelope::{DaemonRequest, V1Request};
-pub use gateway::{GatewayKeyAddParams, GatewayKeyRemoveParams, GatewayScopeParams};
+pub use gateway::GatewayKeyRemoveParams;
 pub use pap::{CreatePolicyParams, CreateScopeParams, UpdatePolicyParams};
 pub use query::SecQueryParams;
 pub use response::{

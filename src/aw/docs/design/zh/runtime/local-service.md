@@ -35,9 +35,23 @@ daemon 独立于前台 Agent。服务执行记录不能认证 Agent 已采用响
 帧空间包含字节数组编码为 JSON 后的膨胀。
 
 请求包含 `api_version`、`identity`、`deadline_ns` 和 `operation`。
+`Client::connect_with_status` 同时返回经过认证的发现状态与保留身份的客户端。
+服务复用直接核对该响应中的 revision、PID 与审计健康状态，省去第二次 Status RPC。
+该状态仅代表发现时刻，后续调用继续校验保留的身份。
+
 首次 `status` 请求可以不提供身份，后续请求必须匹配本次服务启动生成的 generation
 和原始配置字节的 SHA-256 revision。即使文件没有变化，重启也会使旧客户端与句柄
 失效。修改文件不会热更新正在运行的服务。
+
+`Client::connect` 用于发现未知服务的身份。回调传输已有服务签发的绑定时，使用
+`Client::from_identity` 保留该身份，省去额外的 Status 交互。构造过程不执行 I/O；
+每次操作仍校验 Unix peer、协议、generation、配置和期限。绑定失效时直接失败，
+不会重新发现或自动重试。
+
+公共 JavaScript 和 Python Scope 通过一次 `aw scope --action activate` 子进程调用，
+完成原生路由安装确认、启用调用和取得监视版本。服务操作保持原有顺序，共享 CLI
+的五秒期限。原生 owner 在激活前后检查接点，失败时关闭子 Scope，确认后响应丢失
+也沿用此清理流程。既有独立 Scope 操作继续保留。
 
 | `operation.method` | 信封以外的输入 | 结果 |
 | --- | --- | --- |
@@ -285,6 +299,10 @@ socket。`auto` 将路径选择交给启动方，`aw serve` 仍要求 `--state-d
 选择 `$XDG_RUNTIME_DIR/aw/<revision-prefix>`；未设置运行目录变量时使用
 `/tmp/aw-UID/<revision-prefix>`。显式提供的运行目录必须已存在、属于当前用户并
 具备私有权限。路径为适应 Unix socket 长度使用版本前缀，复用仍校验完整配置版本。
+
+Service 启动文档校验一次，资源限额和证据源初始化共用该不可变配置。
+证据校验与公开审计投影共用进程内编译的契约 Registry。新 binding 和策略更新
+仍分别校验自身文档并完成 Provider 准入，不缓存就绪状态或策略判定。
 
 启动阶段持有状态目录专属的私有锁，并写入不可变配置快照。新服务使用独立 session、
 空 stdin/stdout 和私有 stderr 日志。已有服务通过身份及审计健康检查后才复用；

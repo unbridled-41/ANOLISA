@@ -49,7 +49,9 @@
     "aw-host/test/tool_matching",
     "aw-provider-sec-core/test/pii",
     "aw-provider-sec-core/test/pii_transport",
-    "aw-cli/test/native_setup"
+    "aw-cli/test/native_setup",
+    "aw-cli/test/deepseek",
+    "aw-cli/test/codex"
   ],
   "cases": {
     "package-doctor-files": {
@@ -114,7 +116,7 @@
     },
     "hermes-lifecycle": {
       "target": "aw-cli/test/launcher",
-      "test": "hermes_probes_and_install_writers_cancel_and_reap_on_signals"
+      "test": "hermes_trust::signals::hermes_probes_and_install_writers_cancel_and_reap_on_signals"
     },
     "qwenpaw-lifecycle": {
       "target": "aw-cli/test/qwenpaw",
@@ -1203,6 +1205,50 @@
     "service-expired-handoff": {
       "target": "aw-service/lib/aw_service",
       "test": "runtime::expired::tests::queued_requests_survive_expiry_retirement"
+    },
+    "input-rewrite": {
+      "target": "aw-cli/test/pretool",
+      "test": "input_rewrite::same_call_rewrite_is_checked_before_native_adoption_for_supported_adapters"
+    },
+    "deepseek-lifecycle": {
+      "target": "aw-cli/test/deepseek",
+      "test": "profile_overlay_blocks_tools_and_releases_binding"
+    },
+    "deepseek-final-check": {
+      "target": "aw-adapter/lib/aw_adapter",
+      "test": "adapters::deepseek::tests::final_security_check_is_an_independent_route"
+    },
+    "submit-deepseek": {
+      "target": "aw-adapter/lib/aw_adapter",
+      "test": "adapters::deepseek::tests::submission_uses_the_shared_input_contract"
+    },
+    "codex-launch": {
+      "target": "aw-cli/test/codex",
+      "test": "native_launch_preserves_config_serializes_steps_and_cleans_instances"
+    },
+    "codex-admission": {
+      "target": "aw-cli/test/codex",
+      "test": "untrusted_disabled_and_unsupported_launches_never_start_tools"
+    },
+    "codex-interruption": {
+      "target": "aw-cli/test/codex",
+      "test": "interrupted_native_launch_releases_binding_and_owned_process"
+    },
+    "codex-submission": {
+      "target": "aw-cli/test/codex",
+      "test": "submission_denial_prevents_tool_execution_and_releases_event"
+    },
+    "codex-large-denial": {
+      "target": "aw-cli/test/codex",
+      "test": "report_cannot_override_a_large_native_denial"
+    },
+    "codex-capacity": {
+      "target": "aw-cli/test/codex",
+      "test": "app_server_legacy_capacity_blocks_and_recovers_on_relaunch"
+    },
+    "codex-replacement": {
+      "target": "aw-cli/test/codex",
+      "test": "native_replacement_returns_feedback_to_codex"
     }
   },
   "agents": {
@@ -1214,6 +1260,9 @@
           ],
           "block": [
             "security-retry"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1255,10 +1304,12 @@
       "security": [
         "security-retry",
         "scope-native-skips",
-        "coverage-native-identity"
+        "coverage-native-identity",
+        "input-rewrite"
       ],
       "tokenless": [
-        "final-replacement"
+        "final-replacement",
+        "input-rewrite"
       ]
     },
     "claude-sdk": {
@@ -1271,6 +1322,9 @@
           "block": [
             "security-retry",
             "claude-managed-mcp-ownership"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1337,12 +1391,14 @@
         "security-retry",
         "scope-native-skips",
         "coverage-native-identity",
-        "claude-submission"
+        "claude-submission",
+        "input-rewrite"
       ],
       "tokenless": [
         "final-replacement",
         "claude-managed-mcp",
-        "scope-sdk-result"
+        "scope-sdk-result",
+        "input-rewrite"
       ]
     },
     "hermes": {
@@ -1353,6 +1409,9 @@
           ],
           "block": [
             "security-retry"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1394,10 +1453,12 @@
         "coverage-native-identity",
         "hermes-native-veto",
         "hermes-native-input-success",
-        "hermes-native-skill-policy"
+        "hermes-native-skill-policy",
+        "input-rewrite"
       ],
       "tokenless": [
-        "final-replacement"
+        "final-replacement",
+        "input-rewrite"
       ]
     },
     "openclaw": {
@@ -1459,6 +1520,9 @@
           "block": [
             "security-retry",
             "scope-pi-order"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1528,11 +1592,13 @@
         "pi-submission",
         "pi-submission-projection",
         "pi-strict-fault",
-        "pi-strict-version"
+        "pi-strict-version",
+        "input-rewrite"
       ],
       "tokenless": [
         "final-replacement",
-        "scope-pi-result"
+        "scope-pi-result",
+        "input-rewrite"
       ]
     },
     "qoder": {
@@ -1543,6 +1609,9 @@
           ],
           "block": [
             "security-retry"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1603,10 +1672,12 @@
       "security": [
         "security-retry",
         "scope-native-skips",
-        "coverage-native-identity"
+        "coverage-native-identity",
+        "input-rewrite"
       ],
       "tokenless": [
-        "final-replacement"
+        "final-replacement",
+        "input-rewrite"
       ]
     },
     "qwenpaw": {
@@ -1617,6 +1688,9 @@
           ],
           "block": [
             "security-retry"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1722,12 +1796,14 @@
         "prompt-failure",
         "pii-policy",
         "pii-completeness",
-        "pii-residual"
+        "pii-residual",
+        "input-rewrite"
       ],
       "tokenless": [
         "final-replacement",
         "scope-sdk-result",
-        "qwenpaw-resident-denial"
+        "qwenpaw-resident-denial",
+        "input-rewrite"
       ]
     },
     "qoder-sdk": {
@@ -1740,6 +1816,9 @@
           "block": [
             "security-retry",
             "scope-qoder-sdk-order"
+          ],
+          "replace_input": [
+            "input-rewrite"
           ]
         },
         "tool.after": {
@@ -1816,12 +1895,113 @@
         "pii-policy",
         "pii-completeness",
         "pii-residual",
-        "qoder-sdk-skill-resolution"
+        "qoder-sdk-skill-resolution",
+        "input-rewrite"
       ],
       "tokenless": [
         "security-retry",
-        "final-replacement"
+        "final-replacement",
+        "input-rewrite"
       ]
+    },
+    "deepseek-harness": {
+      "events": {
+        "input.submit": {
+          "observe": [
+            "submit-deepseek"
+          ],
+          "block": [
+            "submit-deepseek"
+          ]
+        },
+        "tool.before": {
+          "observe": [
+            "security-retry"
+          ],
+          "block": [
+            "security-retry"
+          ]
+        },
+        "tool.after": {
+          "observe": [
+            "final-replacement"
+          ],
+          "replace_result": [
+            "final-replacement"
+          ]
+        },
+        "security.violation": {
+          "observe": [
+            "deepseek-final-check"
+          ],
+          "block": [
+            "deepseek-final-check"
+          ]
+        }
+      },
+      "lifecycle": [
+        "deepseek-lifecycle",
+        "cancel-initialization"
+      ],
+      "security": [
+        "security-retry"
+      ],
+      "tokenless": [
+        "final-replacement",
+        "security-retry"
+      ]
+    },
+    "codex": {
+      "events": {
+        "input.submit": {
+          "observe": [
+            "codex-submission"
+          ],
+          "block": [
+            "codex-submission",
+            "security-retry"
+          ]
+        },
+        "tool.before": {
+          "observe": [
+            "codex-launch"
+          ],
+          "block": [
+            "codex-launch",
+            "security-retry"
+          ]
+        },
+        "tool.after": {
+          "observe": [
+            "codex-launch"
+          ],
+          "replace_result": [
+            "final-replacement",
+            "codex-replacement"
+          ]
+        }
+      },
+      "lifecycle": [
+        "codex-launch",
+        "codex-admission",
+        "codex-interruption",
+        "codex-capacity",
+        "codex-submission"
+      ],
+      "security": [
+        "security-retry",
+        "codex-large-denial",
+        "codex-submission"
+      ],
+      "tokenless": [
+        "codex-launch",
+        "codex-admission",
+        "final-replacement"
+      ],
+      "admission": [
+        "codex-admission"
+      ],
+      "unsupported": {}
     }
   },
   "providers": {

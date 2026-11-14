@@ -25,8 +25,9 @@ Tool Ready is product-wide hard-disabled and is not part of this API.
 Python hook integrations keep host protocol rules in
 `adapters/tokenless/<host>/hook_adapter.py`: payload parsing, capability checks,
 and replacement envelopes belong to that host. For example, Cosh-NG serializes
-shell replacements as text, while Claude Code and QwenWork preserve structured
-slots; Qoder preserves its native Bash stdout object. `common/hooks` contains
+shell replacements as text, Claude Code preserves structured slots, QwenWork
+replaces single-stream shell `stdout` as text while preserving non-shell
+structured MCP slots, and Qoder preserves its native Bash stdout object. `common/hooks` contains
 Protocol v2 transport, normalized result transformations, and lifecycle state.
 Its historical command files remain bootstrap entrypoints; host selection lives
 in `adapters/tokenless/hook_dispatch.py`. Cosh extensions bundle their adapters,
@@ -77,8 +78,9 @@ that parser for `command_output` searches and routes them, like the native `Grep
 `SearchResultsCompressor`. Its unified entry recognizes numbered path matches and path lists;
 format recognition and savings checks stay inside the compressor. Disabled search compression
 or no candidate returns the original, including with `force_json`, without trying another domain.
-Qoder's native Bash adapter sends only `stdout` to Core, even when it is short or empty or
-`stderr` is larger, and preserves every other field when rewrapping the result.
+Qoder's native Bash adapter replaces only a string `stdout`, even when it is short or empty or
+`stderr` is larger. A missing or non-string `stdout` disables replacement; error diagnostics
+can still inspect `stderr`. Rewrapping preserves every other field.
 
 This protection covers the complete output of any compound command containing a recognized
 search. For example, `grep -q needle Cargo.toml && cargo build` also keeps its build log
@@ -106,7 +108,9 @@ QwenWork's hook adapter normalizes recognized workspace Shell MCP names to `Bash
 before either lifecycle request. It unwraps only an exact single plain text block;
 unknown block arrays pass through without compression. The workspace event's
 absolute `cwd` anchors `.tokenless` state for both hooks and the RTK command.
-Native Bash keeps the existing state location and structured response handling.
+Native Bash keeps the existing state location and replaces only single-stream
+`stdout` in the host's text slot, passing multi-stream, failed, or unfamiliar
+shell envelopes through while enforcing net savings on the delivered replacement.
 Plugin-private binaries are resolved by the adapter. On macOS, a verified PreTool
 bridge anchors standalone recovery commands to that binary and the same state,
 Stash selection and attribution. Without that bridge, private runtime paths declare

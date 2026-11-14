@@ -351,6 +351,13 @@ fn run_with_effects(
     ctx: &CliContext,
     effects: &dyn TelemetryEffects,
 ) -> Result<TelemetryApplicationOutcome, CliError> {
+    // Rejected before the plan branch so a preview cannot advertise an option the
+    // apply path refuses. The ordering is only guaranteed inside the handler: the
+    // CLI policy check in `commands::dispatch` runs first and may report a
+    // permission error to an unprivileged caller before this line is reached.
+    if matches!(&request, TelemetryRequest::Prepare { .. }) {
+        reject_unsupported_prepare_options(ctx)?;
+    }
     if matches!(request.intent(), ExecutionIntent::Plan) {
         if ctx.install_mode != InstallMode::System {
             let command = request.command();
@@ -600,6 +607,44 @@ fn execute_prepare(
     })
 }
 
+/// Rejects options `telemetry prepare` cannot honor.
+///
+/// The command writes the resident unit into the fixed system unit tree and
+/// enables it through the host manager. A relocated `--prefix` would drop the
+/// unit where systemd never looks, and `--install-mode user` would still write
+/// system paths, so both would report success over an image that stays
+/// disabled. Images are prepared from inside their own root instead.
+///
+/// Checked at the [`run_with_effects`] entry, before the plan branch and before
+/// [`TelemetryEffects::require_root`], so a `--dry-run` preview cannot advertise
+/// options the apply path refuses. The check still sits behind the CLI policy
+/// check in `commands::dispatch`, which answers a permission error first for an
+/// unprivileged caller in system mode. `prepare` is an image-build command, so
+/// that ordering is accepted instead of being pushed into the argument parser.
+fn reject_unsupported_prepare_options(ctx: &CliContext) -> Result<(), CliError> {
+    const COMMAND: &str = "telemetry prepare";
+    if let Some(prefix) = ctx.prefix.as_deref()
+        && prefix != Path::new("/")
+    {
+        return Err(CliError::InvalidArgument {
+            command: COMMAND.to_string(),
+            reason: format!(
+                "`--prefix {}` is not supported: the resident unit must live in the system unit tree systemd reads, so it would be written but never enabled; run this command inside the image root instead",
+                prefix.display()
+            ),
+        });
+    }
+    if ctx.install_mode != InstallMode::System {
+        return Err(CliError::InvalidArgument {
+            command: COMMAND.to_string(),
+            reason:
+                "`telemetry prepare` always writes the system unit tree; drop `--install-mode user`"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn runtime(command: &str, error: impl std::fmt::Display) -> CliError {
     CliError::Runtime {
         command: command.to_string(),
@@ -668,13 +713,47 @@ where
     const UNIT_TEMPLATE: &str = include_str!("../../../../../systemd/anolisa-telemetry.service.in");
 
     let executable = current_exe().map_err(|error| runtime(command, error))?;
-    let unit_content = UNIT_TEMPLATE.replace("@@ANOLISA_BIN@@", &executable.display().to_string());
+    let executable = systemd_exec_path(&executable).ok_or_else(|| {
+        runtime(
+            command,
+            format!(
+                "executable path {} is not valid UTF-8, so it cannot be written into a unit",
+                executable.display()
+            ),
+        )
+    })?;
+    let unit_content = UNIT_TEMPLATE.replace("@@ANOLISA_BIN@@", &executable);
     let layout = FsLayout::system(ctx.prefix.clone());
     let unit_path = layout.systemd_unit_dir.join(UNIT_FILENAME);
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent).map_err(|error| runtime(command, error))?;
     }
     fs::write(&unit_path, unit_content).map_err(|error| runtime(command, error))
+}
+
+/// Quotes a path for a systemd `Exec*=` command line.
+///
+/// systemd splits these lines on whitespace, so an executable reached through a
+/// path containing spaces must be quoted or the unit runs a truncated command.
+/// Inside the quotes systemd still expands `%` specifiers, so a literal `%` is
+/// doubled. A `$` is written as-is: command-line variables are substituted only
+/// in the arguments, never in the program to execute, so `$$` here would make
+/// systemd look for a literal `$$` directory. Returns `None` when the path is
+/// not valid UTF-8, which cannot be represented in a unit file.
+fn systemd_exec_path(path: &Path) -> Option<String> {
+    let raw = path.to_str()?;
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('"');
+    for character in raw.chars() {
+        match character {
+            '%' => quoted.push_str("%%"),
+            '\\' => quoted.push_str(r"\\"),
+            '"' => quoted.push_str("\\\""),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    Some(quoted)
 }
 
 fn disable_service_with<R: CommandRunner>(systemd: &Systemd<R>) -> Result<(), String> {
@@ -1399,18 +1478,183 @@ mod tests {
         let ctx = sandbox.context(InstallMode::System);
         let unit_path = ctx.layout().systemd_unit_dir.join(UNIT_FILENAME);
         let executable = sandbox.root().join("bin with spaces/anolisa");
+        let unquoted_exec_start = format!("ExecStart={} ", executable.display());
+        // Spelled out here instead of calling the renderer, so a missing quote
+        // cannot pass by being exactly as wrong as the code under test (#9806).
         let expected = include_str!("../../../../../systemd/anolisa-telemetry.service.in")
-            .replace("@@ANOLISA_BIN@@", &executable.display().to_string());
+            .replace("@@ANOLISA_BIN@@", &format!("\"{}\"", executable.display()));
         let runner = ScriptedRunner::new(vec![output(Some(0), "", "")]);
         let calls = runner.calls.clone();
         install_and_enable_service_offline_with(&ctx, &Systemd::with_runner(runner), || {
             Ok(executable)
         })
         .unwrap();
-        assert_eq!(fs::read_to_string(&unit_path).unwrap(), expected);
+        let rendered = fs::read_to_string(&unit_path).unwrap();
+        assert_eq!(rendered, expected);
+        assert!(
+            !rendered.contains(&unquoted_exec_start),
+            "unquoted executable path in unit: {rendered}"
+        );
         assert_eq!(
             *calls.borrow(),
             vec![vec!["--no-reload", "enable", SERVICE_NAME]]
+        );
+    }
+
+    #[test]
+    fn unit_file_quotes_and_escapes_the_executable_path() {
+        let sandbox = TestSandbox::new();
+        let ctx = sandbox.context(InstallMode::System);
+        let executable = Path::new("/tmp/a b/c\"d\\e%f$g/anolisa");
+        write_unit_file("telemetry prepare", &ctx, || Ok(executable.to_path_buf())).unwrap();
+        let rendered =
+            fs::read_to_string(ctx.layout().systemd_unit_dir.join(UNIT_FILENAME)).unwrap();
+        // The `$` stays single: systemd substitutes variables only in the
+        // arguments, never in the executable path, so doubling it would point
+        // the unit at a directory that does not exist.
+        assert!(
+            rendered.contains(r#"ExecStartPre="/tmp/a b/c\"d\\e%%f$g/anolisa" telemetry init"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains(r#"ExecStart="/tmp/a b/c\"d\\e%%f$g/anolisa" telemetry upload --loop"#),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_relocated_prefix() {
+        let effects = FakeEffects {
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let ctx = context_for_root(
+            Path::new("/tmp/anolisa-telemetry-application"),
+            InstallMode::System,
+            Some(PathBuf::from("/tmp/anolisa-telemetry-application/prefix")),
+            TestContextOptions::default(),
+        );
+        let error = run_with_effects(
+            TelemetryRequest::Prepare {
+                no_service: false,
+                intent: ExecutionIntent::Apply,
+            },
+            &ctx,
+            &effects,
+        )
+        .expect_err("a relocated prefix must fail instead of enabling the host unit");
+        assert_eq!(error.code(), "INVALID_ARGUMENT");
+        assert!(error.reason().contains("--prefix"));
+        // The rejection precedes the root check, every write and every systemctl call.
+        assert!(effects.calls().is_empty(), "calls: {:?}", effects.calls());
+    }
+
+    #[test]
+    fn prepare_dry_run_rejects_a_relocated_prefix() {
+        let effects = FakeEffects {
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let ctx = context_for_root(
+            Path::new("/tmp/anolisa-telemetry-application"),
+            InstallMode::System,
+            Some(PathBuf::from("/tmp/anolisa-telemetry-application/prefix")),
+            TestContextOptions::default(),
+        );
+        let error = run_with_effects(
+            TelemetryRequest::Prepare {
+                no_service: false,
+                intent: ExecutionIntent::Plan,
+            },
+            &ctx,
+            &effects,
+        )
+        .expect_err("a preview must not accept an option the apply path refuses");
+        assert_eq!(error.code(), "INVALID_ARGUMENT");
+        assert!(error.reason().contains("--prefix"));
+        // Rejected before the plan branch: no preview was produced.
+        assert!(effects.calls().is_empty(), "calls: {:?}", effects.calls());
+    }
+
+    #[test]
+    fn prepare_reports_unsupported_options_before_the_root_error() {
+        // Handler-level check: `commands::dispatch` validates the CLI policy first,
+        // so this test does not exercise the unprivileged CLI entry point.
+        let effects = FakeEffects {
+            root_error: Some("requires root"),
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let ctx = context_for_root(
+            Path::new("/tmp/anolisa-telemetry-application"),
+            InstallMode::System,
+            Some(PathBuf::from("/tmp/anolisa-telemetry-application/prefix")),
+            TestContextOptions::default(),
+        );
+        let error = run_with_effects(
+            TelemetryRequest::Prepare {
+                no_service: false,
+                intent: ExecutionIntent::Apply,
+            },
+            &ctx,
+            &effects,
+        )
+        .expect_err("an unsupported option must be reported without asking for root");
+        assert_eq!(error.code(), "INVALID_ARGUMENT");
+        assert!(error.reason().contains("--prefix"));
+        assert!(effects.calls().is_empty(), "calls: {:?}", effects.calls());
+    }
+
+    #[test]
+    fn prepare_rejects_user_scope_before_the_root_check() {
+        let effects = FakeEffects {
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let error = run_with_effects(
+            TelemetryRequest::Prepare {
+                no_service: false,
+                intent: ExecutionIntent::Apply,
+            },
+            &ctx(InstallMode::User),
+            &effects,
+        )
+        .expect_err("user scope cannot write the system unit tree");
+        assert_eq!(error.code(), "INVALID_ARGUMENT");
+        assert!(error.reason().contains("--install-mode user"));
+        assert!(effects.calls().is_empty(), "calls: {:?}", effects.calls());
+    }
+
+    #[test]
+    fn prepare_accepts_the_root_prefix() {
+        let effects = FakeEffects {
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let ctx = context_for_root(
+            Path::new("/tmp/anolisa-telemetry-application"),
+            InstallMode::System,
+            Some(PathBuf::from("/")),
+            TestContextOptions::default(),
+        );
+        let outcome = run_with_effects(
+            TelemetryRequest::Prepare {
+                no_service: true,
+                intent: ExecutionIntent::Apply,
+            },
+            &ctx,
+            &effects,
+        )
+        .expect("`--prefix /` names the default tree and must stay accepted");
+        let TelemetryApplicationOutcome::Applied { result, .. } = outcome else {
+            panic!("expected applied outcome");
+        };
+        assert_eq!(
+            result,
+            TelemetryApplied::Prepared {
+                service_enabled: false
+            }
         );
     }
 
@@ -1439,7 +1683,7 @@ mod tests {
         let unit_path = ctx.layout().systemd_unit_dir.join(UNIT_FILENAME);
         let executable = sandbox.root().join("bin with spaces/anolisa");
         let expected = include_str!("../../../../../systemd/anolisa-telemetry.service.in")
-            .replace("@@ANOLISA_BIN@@", &executable.display().to_string());
+            .replace("@@ANOLISA_BIN@@", &format!("\"{}\"", executable.display()));
         let mut runner =
             ScriptedRunner::new(vec![output(Some(0), "", ""), output(Some(0), "", "")]);
         runner.expected_unit = Some((unit_path.clone(), expected.clone()));
@@ -1872,52 +2116,64 @@ mod tests {
                         _ => unreachable!(),
                     }
                     assert!(stderr.is_empty());
+                } else if mode.ends_with("json") {
+                    let json: serde_json::Value = serde_json::from_str(rendered).unwrap();
+                    let (command, data) = match scenario {
+                        "enable" | "enable-failure" => (
+                            "telemetry enable",
+                            serde_json::json!({"collection_enabled": true}),
+                        ),
+                        "disable" | "disable-failure" => (
+                            "telemetry disable",
+                            serde_json::json!({"collection_enabled": false}),
+                        ),
+                        "link" | "already-linked" => (
+                            "telemetry link",
+                            serde_json::json!({
+                                "linked": true,
+                                "link_id": if scenario == "link" { "generated-link" } else { "existing-link" },
+                                "already_linked": scenario == "already-linked",
+                            }),
+                        ),
+                        "unlink" => ("telemetry unlink", serde_json::json!({"linked": false})),
+                        "upload" => ("telemetry upload", serde_json::json!({"loop_flag": false})),
+                        "init" => ("telemetry init", serde_json::json!({"initialized": true})),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(json["ok"], true);
+                    assert_eq!(json["schema_version"], crate::response::SCHEMA_VERSION);
+                    assert_eq!(json["command"], command);
+                    assert_eq!(json["data"], data);
+                    // `--json` carries warnings in the envelope only: a script that
+                    // parses stdout must never have to scrape stderr as well.
+                    assert_eq!(
+                        json["warnings"],
+                        match scenario {
+                            "enable-failure" => serde_json::json!([
+                                "could not enable anolisa-telemetry.service (execution failed: systemctl daemon-reload failed: reload denied); falling back to lazy start",
+                                "telemetry enabled, but uploader failed to start: spawn failed",
+                            ]),
+                            "disable-failure" => serde_json::json!([
+                                "failed to disable anolisa-telemetry.service: systemctl command failed: disable denied",
+                            ]),
+                            _ => serde_json::json!([]),
+                        }
+                    );
+                    assert!(stderr.is_empty(), "json mode wrote to stderr: {stderr}");
                 } else {
-                    if mode.ends_with("json") {
-                        let json: serde_json::Value = serde_json::from_str(rendered).unwrap();
-                        let (command, data) = match scenario {
-                            "enable" | "enable-failure" => (
-                                "telemetry enable",
-                                serde_json::json!({"collection_enabled": true}),
-                            ),
-                            "disable" | "disable-failure" => (
-                                "telemetry disable",
-                                serde_json::json!({"collection_enabled": false}),
-                            ),
-                            "link" | "already-linked" => (
-                                "telemetry link",
-                                serde_json::json!({
-                                    "linked": true,
-                                    "link_id": if scenario == "link" { "generated-link" } else { "existing-link" },
-                                    "already_linked": scenario == "already-linked",
-                                }),
-                            ),
-                            "unlink" => ("telemetry unlink", serde_json::json!({"linked": false})),
-                            "upload" => {
-                                ("telemetry upload", serde_json::json!({"loop_flag": false}))
-                            }
-                            "init" => ("telemetry init", serde_json::json!({"initialized": true})),
+                    assert_eq!(
+                        rendered,
+                        match scenario {
+                            "enable" | "enable-failure" => "Telemetry collection enabled.\n",
+                            "disable" | "disable-failure" =>
+                                "Telemetry collection disabled.\n  The uploader stops shortly; buffered logs are preserved.\n",
+                            "link" => "Linked to named reporting.\n  link id: generated-link\n",
+                            "already-linked" => "Already linked (link id: existing-link).\n",
+                            "unlink" => "Unlinked from named reporting.\n",
+                            "upload" | "init" => "",
                             _ => unreachable!(),
-                        };
-                        assert_eq!(json["ok"], true);
-                        assert_eq!(json["schema_version"], crate::response::SCHEMA_VERSION);
-                        assert_eq!(json["command"], command);
-                        assert_eq!(json["data"], data);
-                    } else {
-                        assert_eq!(
-                            rendered,
-                            match scenario {
-                                "enable" | "enable-failure" => "Telemetry collection enabled.\n",
-                                "disable" | "disable-failure" =>
-                                    "Telemetry collection disabled.\n  The uploader stops shortly; buffered logs are preserved.\n",
-                                "link" => "Linked to named reporting.\n  link id: generated-link\n",
-                                "already-linked" => "Already linked (link id: existing-link).\n",
-                                "unlink" => "Unlinked from named reporting.\n",
-                                "upload" | "init" => "",
-                                _ => unreachable!(),
-                            }
-                        );
-                    }
+                        }
+                    );
                     assert_eq!(
                         stderr,
                         match scenario {

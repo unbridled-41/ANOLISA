@@ -2,12 +2,12 @@
 #![cfg(target_os = "linux")]
 
 use asc_daemon_protocol::authorization::{
-    AgentPrincipal, AuthorizationRequest, Decision, DecisionVerdict, ExecutionReceipt, LaunchSpec,
-    OsPermissionSet, ReceiptAck,
+    AgentPrincipal, Decision, DecisionVerdict, ExecutionReceipt, LaunchSpec,
+    OsAuthorizationRequest, OsPermissionSet, ReceiptAck,
 };
 use asc_pep_runtime::{
-    ApprovalHandler, AuthorizationClient, FixedPermissions, PepError, PepRuntime,
-    PreparedInvocation, SandboxBackend, prepare_launch,
+    ApprovalHandler, AuthorizationClient, FixedPermissions, PepError, PepRuntime, PermissionInput,
+    PermissionProvider, PreparedInvocation, SandboxBackend, prepare_launch,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -21,19 +21,19 @@ struct Client {
     fail_report: bool,
 }
 impl AuthorizationClient for Client {
-    fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError> {
+    fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError> {
         self.calls.set(self.calls.get() + 1);
         Ok(Decision {
             decision_id: "decision-1".into(),
             request_id: request.request_id.clone(),
-            execution_id: request.execution_id.clone(),
+            execution_id: request.context.execution_id.clone(),
             request_digest: request.digest()?,
             policy_version: "version-1".into(),
             expires_at: now() + 60,
-            principal: request.principal.clone(),
-            launch: request.launch.clone(),
+            principal: request.context.agent.clone(),
+            launch: request.context.launch.clone(),
             verdict: self.verdict,
-            effective_permissions: Some(request.requested_permissions.clone()),
+            effective_permissions: Some(request.context.requested_permissions.clone()),
             reason: "test".into(),
             approval_requirements: vec![],
             warnings: vec![],
@@ -65,8 +65,7 @@ fn now() -> u64 {
 }
 fn principal() -> AgentPrincipal {
     AgentPrincipal {
-        agent_id: "test-agent".into(),
-        agent_type: "codex".into(),
+        agent_type: Some("codex".into()),
     }
 }
 fn permissions(path: &std::path::Path) -> OsPermissionSet {
@@ -165,7 +164,7 @@ fn pushed_decisions_reject_replay_changed_argv_and_expiry() {
     let request = request(launch, permissions.0);
     let decision = client.evaluate(&request.request).unwrap();
     let mut changed = request.clone();
-    changed.request.launch.args.push("changed".into());
+    changed.request.context.launch.args.push("changed".into());
     assert!(
         runtime
             .apply(&changed, decision.clone(), &client, None)
@@ -260,7 +259,7 @@ fn approval_cannot_refresh_changed_path_identity() {
 fn authorized_modify_and_approval_execute_without_a_second_evaluation() {
     struct TransformClient(Client);
     impl AuthorizationClient for TransformClient {
-        fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError> {
+        fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError> {
             let mut decision = self.0.evaluate(request)?;
             decision.launch.args = vec!["authorized".into()];
             Ok(decision)
@@ -277,21 +276,34 @@ fn authorized_modify_and_approval_execute_without_a_second_evaluation() {
         }
     }
     for verdict in [DecisionVerdict::Modify, DecisionVerdict::StepUp] {
-        let (_directory, mut runtime, launch, permissions) = fixture();
-        let client = TransformClient(client(verdict));
-        let result = runtime
-            .run(
-                &principal(),
-                launch,
-                &permissions,
-                &client,
-                Some(&mut FinalApproval),
-            )
+        for cedar_input in [false, true] {
+            let (_directory, mut runtime, launch, permissions) = fixture();
+            let cedar = PermissionInput::parse(&format!(
+                r#"permit(principal, action == SecCore::Action::"file.read", resource);
+permit(principal, action == SecCore::Action::"file.exec", resource)
+when {{ resource.path == {} && context.input.arg_count == 0 }};"#,
+                serde_json::json!(launch.resolved_program)
+            ))
             .unwrap();
-        assert!(result.result.started, "{:?}", result.result.error);
-        assert_eq!(result.decision.launch.args, vec!["authorized"]);
-        assert_eq!(client.0.calls.get(), 1);
-        assert_eq!(client.0.receipts.borrow().len(), 1);
+            let provider: &dyn PermissionProvider = if cedar_input { &cedar } else { &permissions };
+            let mut transformed = launch.clone();
+            transformed.args = vec!["authorized".into()];
+            assert!(cedar.resolve(&transformed).is_err());
+            let client = TransformClient(client(verdict));
+            let result = runtime
+                .run(
+                    &principal(),
+                    launch,
+                    provider,
+                    &client,
+                    Some(&mut FinalApproval),
+                )
+                .unwrap();
+            assert!(result.result.started, "{:?}", result.result.error);
+            assert_eq!(result.decision.launch.args, vec!["authorized"]);
+            assert_eq!(client.0.calls.get(), 1);
+            assert_eq!(client.0.receipts.borrow().len(), 1);
+        }
     }
 }
 
@@ -353,10 +365,11 @@ fn modified_decision_cannot_expand_the_requested_permissions() {
 fn prepared_alias_keeps_both_identities_for_direct_modified_launch() {
     struct AliasClient(Client, String);
     impl AuthorizationClient for AliasClient {
-        fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError> {
+        fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError> {
             let mut decision = self.0.evaluate(request)?;
             assert!(
                 request
+                    .context
                     .requested_permissions
                     .filesystem
                     .rules

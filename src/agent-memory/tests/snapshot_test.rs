@@ -78,6 +78,48 @@ fn restore_unknown_id_returns_not_found() {
 }
 
 #[test]
+fn restore_and_reclaim_reject_non_regular_lock_paths() {
+    for kind in ["symlink", "fifo", "directory"] {
+        let (tmp, svc) = setup();
+        svc.write("doc.md", "snapshot", false).unwrap();
+        let snapshot = svc.mem_snapshot(None).unwrap();
+        svc.write("doc.md", "live", true).unwrap();
+        let lock_path = svc.mount.meta_dir.join(".restore.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "untouched").unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&outside, &lock_path).unwrap(),
+            "fifo" => nix::unistd::mkfifo(&lock_path, nix::sys::stat::Mode::S_IRWXU).unwrap(),
+            "directory" => std::fs::create_dir(&lock_path).unwrap(),
+            _ => unreachable!(),
+        }
+        let staging = svc
+            .mount
+            .meta_dir
+            .join(format!("snapshots/.{}.staging", snapshot.id));
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("active.md"), "in progress").unwrap();
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(report.total_removed(), 0, "{kind}");
+        assert!(svc.mem_snapshot_restore(&snapshot.id).is_err(), "{kind}");
+        assert_eq!(svc.read("doc.md").unwrap(), "live", "{kind}");
+        assert!(staging.join("active.md").exists(), "{kind}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        if kind == "directory" {
+            std::fs::remove_dir(&lock_path).unwrap();
+        } else {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        assert_eq!(svc.read("doc.md").unwrap(), "snapshot");
+    }
+}
+
+#[test]
 fn restore_rejects_invalid_gzip_trailer_without_changing_live_files() {
     for truncate_trailer in [false, true] {
         let (_tmp, svc) = setup();
@@ -157,7 +199,7 @@ fn restore_preserves_meta_dir_and_leaves_no_rollback_artefacts() {
     // Regression for B3: the old `delete all + move in` flow left the
     // mount empty for the duration of the move, and a crash there would
     // wipe user data. The new flow renames each top-level entry aside
-    // under `.anolisa/.<id>.rollback.*` and drops them only after the
+    // under `.anolisa/.<id>.rollback.*` and retains them in trash after the
     // staging swap completes. This test verifies the happy path leaves
     // no rollback leftovers under .anolisa/.
     let (_tmp, svc) = setup();
@@ -191,6 +233,191 @@ fn restore_preserves_meta_dir_and_leaves_no_rollback_artefacts() {
         "rollback artefacts not cleaned up: {:?}",
         leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn repeated_restore_preserves_every_displaced_tree() {
+    let (_tmp, svc) = setup();
+    svc.write("doc.md", "baseline", false).unwrap();
+    svc.write("notes/a.md", "baseline", false).unwrap();
+    let snapshot = svc.mem_snapshot(None).unwrap();
+    let mut expected = Vec::new();
+
+    for version in ["first", "second", "third"] {
+        svc.write("doc.md", version, true).unwrap();
+        svc.write("notes/a.md", version, true).unwrap();
+        svc.write("new.md", version, false).unwrap();
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        assert_eq!(svc.read("doc.md").unwrap(), "baseline");
+        assert_eq!(svc.read("notes/a.md").unwrap(), "baseline");
+        assert!(!svc.mount.root.join("new.md").exists());
+
+        expected.push(version.to_owned());
+        let mut retained = Vec::new();
+        for entry in std::fs::read_dir(svc.mount.meta_dir.join("trash")).unwrap() {
+            let path = entry.unwrap().path();
+            let content = std::fs::read_to_string(path.join("doc.md")).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(path.join("notes/a.md")).unwrap(),
+                content
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.join("new.md")).unwrap(),
+                content
+            );
+            retained.push(content);
+        }
+        retained.sort();
+        assert_eq!(retained, expected);
+        let prefix = format!(".{}.rollback.", snapshot.id);
+        assert!(
+            std::fs::read_dir(&svc.mount.meta_dir)
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                })
+        );
+    }
+}
+
+#[test]
+fn restore_preserves_legacy_rollback_files_and_directories() {
+    // Each shape independently reproduces the old overwrite or ENOTEMPTY bug.
+    for directory in [false, true] {
+        let (_tmp, svc) = setup();
+        let live_path = if directory { "notes/a.md" } else { "doc.md" };
+        let leaf = if directory { "notes" } else { "doc.md" };
+        svc.write(live_path, "baseline", false).unwrap();
+        let snapshot = svc.mem_snapshot(None).unwrap();
+        svc.write(live_path, "current", true).unwrap();
+        let legacy = svc
+            .mount
+            .meta_dir
+            .join(format!(".{}.rollback.{leaf}", snapshot.id));
+        let saved_file = if directory {
+            std::fs::create_dir(&legacy).unwrap();
+            legacy.join("a.md")
+        } else {
+            legacy
+        };
+        std::fs::write(&saved_file, b"irreplaceable old data\0\xff").unwrap();
+
+        let result = svc.mem_snapshot_restore(&snapshot.id);
+        assert_eq!(
+            std::fs::read(&saved_file).unwrap(),
+            b"irreplaceable old data\0\xff",
+            "legacy data changed (directory={directory})"
+        );
+        result.unwrap();
+        assert_eq!(svc.read(live_path).unwrap(), "baseline");
+        let trash = std::fs::read_dir(svc.mount.meta_dir.join("trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read_to_string(trash.join(live_path)).unwrap(),
+            "current"
+        );
+    }
+}
+
+#[test]
+fn unavailable_trash_preserves_separate_rollbacks_and_allows_retry() {
+    let (_tmp, svc) = setup();
+    svc.write("doc.md", "baseline", false).unwrap();
+    svc.write("notes/a.md", "baseline", false).unwrap();
+    let snapshot = svc.mem_snapshot(None).unwrap();
+    let trash = svc.mount.meta_dir.join("trash");
+    std::fs::write(&trash, "obstacle").unwrap();
+
+    for version in ["first", "second"] {
+        svc.write("doc.md", version, true).unwrap();
+        svc.write("notes/a.md", version, true).unwrap();
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        assert_eq!(svc.read("doc.md").unwrap(), "baseline");
+        assert_eq!(svc.read("notes/a.md").unwrap(), "baseline");
+    }
+    assert_eq!(std::fs::read_to_string(&trash).unwrap(), "obstacle");
+    let prefix = format!(".{}.rollback.", snapshot.id);
+    let rollbacks: Vec<_> = std::fs::read_dir(&svc.mount.meta_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect();
+    assert_eq!(rollbacks.len(), 2);
+    let mut saved = Vec::new();
+    for path in &rollbacks {
+        let content = std::fs::read(path.join("doc.md")).unwrap();
+        assert_eq!(std::fs::read(path.join("notes/a.md")).unwrap(), content);
+        saved.push(content);
+    }
+    saved.sort();
+    assert_eq!(saved, [b"first".to_vec(), b"second".to_vec()]);
+
+    std::fs::remove_file(&trash).unwrap();
+    svc.write("doc.md", "third", true).unwrap();
+    svc.mem_snapshot_restore(&snapshot.id).unwrap();
+    assert_eq!(svc.read("doc.md").unwrap(), "baseline");
+    let mut after: Vec<_> = rollbacks
+        .iter()
+        .map(|path| std::fs::read(path.join("doc.md")).unwrap())
+        .collect();
+    after.sort();
+    assert_eq!(after, saved);
+    let retained = std::fs::read_dir(&trash)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        std::fs::read_to_string(retained.join("doc.md")).unwrap(),
+        "third"
+    );
+}
+
+#[test]
+fn unavailable_rollback_directory_leaves_live_files_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let (_tmp, svc) = setup();
+    svc.write("doc.md", "baseline", false).unwrap();
+    let snapshot = svc.mem_snapshot(None).unwrap();
+    svc.write("doc.md", "live", true).unwrap();
+    let permissions = std::fs::metadata(&svc.mount.meta_dir)
+        .unwrap()
+        .permissions();
+    std::fs::set_permissions(&svc.mount.meta_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = svc.mem_snapshot_restore(&snapshot.id);
+    std::fs::set_permissions(&svc.mount.meta_dir, permissions).unwrap();
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("rollback"), "{error}");
+    assert!(
+        error.contains(svc.mount.meta_dir.to_str().unwrap()),
+        "{error}"
+    );
+    assert_eq!(svc.read("doc.md").unwrap(), "live");
+    assert!(
+        !svc.mount
+            .meta_dir
+            .join(format!("snapshots/.{}.staging", snapshot.id))
+            .exists()
+    );
+    svc.mem_snapshot_restore(&snapshot.id).unwrap();
+    assert_eq!(svc.read("doc.md").unwrap(), "baseline");
 }
 
 #[test]
@@ -255,11 +482,9 @@ fn snapshot_restores_nested_readonly_directories() {
     svc.write("reference/nested/guide.md", "new contents", true)
         .unwrap();
     let first = svc.mem_snapshot_restore(&snapshot.id);
-    // A second snapshot avoids the independently tracked same-id trash
-    // collision while exercising an already read-only live directory.
     let result = first.and_then(|()| {
-        let second = svc.mem_snapshot(None)?;
-        svc.mem_snapshot_restore(&second.id)
+        svc.mem_snapshot_restore(&snapshot.id)?;
+        svc.mem_snapshot_restore(&snapshot.id)
     });
     let modes: Vec<_> = ["reference", "reference/nested", "reference/empty"]
         .into_iter()
@@ -322,6 +547,9 @@ fn restore_removes_readonly_staging_left_by_an_interrupted_attempt() {
 #[test]
 fn failed_restore_cleans_readonly_staging_and_can_be_retried() {
     use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
     let (_tmp, svc) = setup();
     svc.write("reference/doc.md", "saved", false).unwrap();
     let reference = svc.mount.root.join("reference");
@@ -329,14 +557,12 @@ fn failed_restore_cleans_readonly_staging_and_can_be_retried() {
     let snapshot = svc.mem_snapshot(None).unwrap();
     std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o755)).unwrap();
     svc.write("reference/doc.md", "live", true).unwrap();
-    // A nonempty owned fixture blocks the first swap without changing live data.
-    let obstacle = svc
-        .mount
-        .meta_dir
-        .join(format!(".{}.rollback.reference", snapshot.id));
-    std::fs::create_dir(&obstacle).unwrap();
-    std::fs::write(obstacle.join("occupied"), "keep").unwrap();
-    assert!(svc.mem_snapshot_restore(&snapshot.id).is_err());
+    // The mount root must be writable to move live entries out of it.
+    let permissions = std::fs::metadata(&svc.mount.root).unwrap().permissions();
+    std::fs::set_permissions(&svc.mount.root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = svc.mem_snapshot_restore(&snapshot.id);
+    std::fs::set_permissions(&svc.mount.root, permissions).unwrap();
+    assert!(result.is_err());
     assert_eq!(svc.read("reference/doc.md").unwrap(), "live");
     let staging = svc
         .mount
@@ -347,7 +573,6 @@ fn failed_restore_cleans_readonly_staging_and_can_be_retried() {
         !staging.exists(),
         "failed restore left read-only staging behind"
     );
-    std::fs::remove_dir_all(obstacle).unwrap();
     svc.mem_snapshot_restore(&snapshot.id).unwrap();
     let mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
     std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -553,12 +778,14 @@ fn reclaim_removes_sidecar_less_archive_but_not_complete_pair() {
 
     // Complete pair: archive + parseable sidecar — must survive.
     let info = sidecar_info("snap_KEEP");
-    std::fs::write(dir.join("snap_KEEP.tar.gz"), b"archive").unwrap();
+    write_valid_archive(&dir, "snap_KEEP", b"archive contents");
     std::fs::write(
         dir.join("snap_KEEP.json"),
         serde_json::to_string(&info).unwrap(),
     )
     .unwrap();
+    age_file(&dir.join("snap_KEEP.tar.gz"), 2 * 24 * 3600);
+    age_file(&dir.join("snap_KEEP.json"), 2 * 24 * 3600);
 
     // Sidecar-less archive, old — removed.
     std::fs::write(dir.join("snap_LOST.tar.gz"), b"archive").unwrap();
@@ -590,6 +817,271 @@ fn reclaim_removes_sidecar_less_archive_but_not_complete_pair() {
 }
 
 #[test]
+fn reclaim_removes_invalid_archives_with_parseable_sidecars() {
+    for kind in [
+        "not_gzip",
+        "zero_bytes",
+        "truncated",
+        "bad_crc",
+        "parent_traversal",
+    ] {
+        let (_tmp, svc) = setup();
+        svc.write("live.md", "unchanged", false).unwrap();
+        let dir = svc.mount.meta_dir.join("snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "snap_BAD";
+        let archive = dir.join(format!("{id}.tar.gz"));
+        let sidecar = dir.join(format!("{id}.json"));
+        write_valid_archive(&dir, id, b"snapshot contents");
+        match kind {
+            "not_gzip" => std::fs::write(&archive, b"not a gzip stream").unwrap(),
+            "zero_bytes" => std::fs::write(&archive, b"").unwrap(),
+            "truncated" => {
+                let mut bytes = std::fs::read(&archive).unwrap();
+                bytes.truncate(bytes.len() - 4);
+                std::fs::write(&archive, bytes).unwrap();
+            }
+            "bad_crc" => {
+                let mut bytes = std::fs::read(&archive).unwrap();
+                let crc_offset = bytes.len() - 8;
+                bytes[crc_offset] ^= 0xff;
+                std::fs::write(&archive, bytes).unwrap();
+            }
+            "parent_traversal" => {
+                write_archive_with_entry(&dir, id, tar::EntryType::Regular, "../escape");
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(&sidecar, serde_json::to_vec(&sidecar_info(id)).unwrap()).unwrap();
+
+        assert_eq!(svc.mem_snapshot_list().unwrap().len(), 1, "{kind}");
+        assert!(svc.mem_snapshot_restore(id).is_err(), "{kind}");
+        assert_eq!(svc.read("live.md").unwrap(), "unchanged", "{kind}");
+
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            Duration::from_secs(24 * 3600),
+        );
+        assert_eq!(report.total_removed(), 0, "{kind}: young pair survives");
+        assert!(archive.exists() && sidecar.exists(), "{kind}");
+
+        age_file(&archive, 2 * 24 * 3600);
+        age_file(&sidecar, 2 * 24 * 3600);
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            Duration::from_secs(24 * 3600),
+        );
+        assert_eq!(report.archives_removed, 1, "{kind}");
+        assert_eq!(report.invalid_archives_removed, 1, "{kind}");
+        assert_eq!(report.sidecars_removed, 1, "{kind}");
+        assert_eq!(report.removal_failures, 0, "{kind}");
+        assert_eq!(report.sidecars_repaired, 0, "{kind}");
+        assert!(!archive.exists() && !sidecar.exists(), "{kind}");
+        assert!(svc.mem_snapshot_list().unwrap().is_empty(), "{kind}");
+        assert_eq!(svc.read("live.md").unwrap(), "unchanged", "{kind}");
+
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            Duration::from_secs(24 * 3600),
+        );
+        assert_eq!(report, Default::default(), "{kind}: repeat sweep is idle");
+    }
+}
+
+#[test]
+fn reclaim_keeps_valid_pairs_including_empty_snapshots() {
+    for empty in [false, true] {
+        let (_tmp, svc) = setup();
+        if !empty {
+            svc.write("notes.md", "snapshot contents", false).unwrap();
+        }
+        let snapshot = svc.mem_snapshot(Some("keep this label")).unwrap();
+        let dir = svc.mount.meta_dir.join("snapshots");
+        let archive = dir.join(format!("{}.tar.gz", snapshot.id));
+        let sidecar = dir.join(format!("{}.json", snapshot.id));
+        let original_sidecar = std::fs::read(&sidecar).unwrap();
+        age_file(&archive, 2 * 24 * 3600);
+        age_file(&sidecar, 2 * 24 * 3600);
+
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            Duration::from_secs(24 * 3600),
+        );
+        assert_eq!(report, Default::default());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), original_sidecar);
+        assert_eq!(svc.mem_snapshot_list().unwrap()[0].name, "keep this label");
+        svc.write("after.md", "after snapshot", false).unwrap();
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        assert!(matches!(
+            svc.read("after.md"),
+            Err(MemoryError::NotFound(_))
+        ));
+        if !empty {
+            assert_eq!(svc.read("notes.md").unwrap(), "snapshot contents");
+        }
+    }
+}
+
+#[test]
+fn reclaim_preserves_unreadable_archives_at_mount_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    for corrupt_sidecar in [false, true] {
+        let (_tmp, svc) = setup();
+        svc.write("notes.md", "backup contents", false).unwrap();
+        let snapshot = svc.mem_snapshot(None).unwrap();
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        let dir = svc.mount.meta_dir.join("snapshots");
+        let archive = dir.join(format!("{}.tar.gz", snapshot.id));
+        let sidecar = dir.join(format!("{}.json", snapshot.id));
+        let archive_bytes = std::fs::read(&archive).unwrap();
+        let permissions = std::fs::metadata(&archive).unwrap().permissions();
+        if corrupt_sidecar {
+            std::fs::write(&sidecar, b"{truncated").unwrap();
+        }
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        age_file(&archive, 2 * 24 * 3600);
+        age_file(&sidecar, 2 * 24 * 3600);
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::read(&archive).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let config = svc.config.clone();
+        drop(svc);
+
+        let svc = MemoryService::new(config.clone()).unwrap();
+        assert!(
+            archive.exists(),
+            "an unreadable backup must survive startup"
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+        let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+            &svc.mount,
+            Duration::from_secs(24 * 3600),
+        );
+        assert_eq!(report.validation_failures, 1);
+        assert_eq!(report.total_removed(), 0);
+        assert_eq!(report.invalid_archives_removed, 0);
+        assert_eq!(report.sidecars_repaired, 0);
+        assert_eq!(report.removal_failures, 0);
+        std::fs::set_permissions(&archive, permissions).unwrap();
+        assert_eq!(std::fs::read(&archive).unwrap(), archive_bytes);
+        drop(svc);
+
+        let svc = MemoryService::new(config).unwrap();
+        assert_eq!(svc.mem_snapshot_list().unwrap().len(), 1);
+        svc.write("notes.md", "live contents", true).unwrap();
+        svc.mem_snapshot_restore(&snapshot.id).unwrap();
+        assert_eq!(svc.read("notes.md").unwrap(), "backup contents");
+    }
+}
+
+#[test]
+fn reclaim_keeps_young_sidecar_after_discarding_invalid_archive() {
+    let (_tmp, svc) = setup();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("snap_BAD.tar.gz");
+    let sidecar = dir.join("snap_BAD.json");
+    std::fs::write(&archive, b"not gzip").unwrap();
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&sidecar_info("snap_BAD")).unwrap(),
+    )
+    .unwrap();
+    age_file(&archive, 2 * 24 * 3600);
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.invalid_archives_removed, 1);
+    assert_eq!(report.total_removed(), 1);
+    assert_eq!(report.kept_young, 1);
+    assert!(sidecar.exists());
+    assert!(svc.mem_snapshot_list().unwrap().is_empty());
+
+    age_file(&sidecar, 2 * 24 * 3600);
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.sidecars_removed, 1);
+    assert!(!sidecar.exists());
+}
+
+#[test]
+fn reclaim_removes_stale_sidecar_when_archive_is_a_directory() {
+    let (_tmp, svc) = setup();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    let archive = dir.join("snap_DIR.tar.gz");
+    let sidecar = dir.join("snap_DIR.json");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::write(archive.join("unrelated.txt"), b"preserve").unwrap();
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&sidecar_info("snap_DIR")).unwrap(),
+    )
+    .unwrap();
+    age_file(&archive, 2 * 24 * 3600);
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.total_removed(), 0);
+    assert!(sidecar.exists(), "the sidecar has its own age guard");
+
+    age_file(&sidecar, 2 * 24 * 3600);
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.sidecars_removed, 1);
+    assert_eq!(report.archives_removed, 0);
+    assert_eq!(report.removal_failures, 0);
+    assert!(!sidecar.exists());
+    assert!(svc.mem_snapshot_list().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(archive.join("unrelated.txt")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[test]
+fn snapshot_list_excludes_missing_or_non_regular_archives() {
+    for kind in ["missing", "directory", "symlink", "fifo"] {
+        let (tmp, svc) = setup();
+        let dir = svc.mount.meta_dir.join("snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("snap_BAD.tar.gz");
+        match kind {
+            "missing" => {}
+            "directory" => std::fs::create_dir(&archive).unwrap(),
+            "symlink" => {
+                let outside = tmp.path().join("outside.tar.gz");
+                std::fs::write(&outside, b"untouched").unwrap();
+                std::os::unix::fs::symlink(outside, &archive).unwrap();
+            }
+            "fifo" => nix::unistd::mkfifo(&archive, nix::sys::stat::Mode::S_IRWXU).unwrap(),
+            _ => unreachable!(),
+        }
+        let sidecar = dir.join("snap_BAD.json");
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec(&sidecar_info("snap_BAD")).unwrap(),
+        )
+        .unwrap();
+        assert!(svc.mem_snapshot_list().unwrap().is_empty(), "{kind}");
+        assert!(sidecar.exists(), "listing must not delete metadata");
+    }
+}
+
+#[test]
 fn reclaim_sweep_at_mount_open_does_not_block_or_delete_live_data() {
     let tmp = tempdir().unwrap();
     let mut cfg = AppConfig::default();
@@ -609,12 +1101,22 @@ fn reclaim_sweep_at_mount_open_does_not_block_or_delete_live_data() {
     age_file(&dir.join("snap_ORPH.tar.gz.partial"), 2 * 24 * 3600);
     std::fs::write(dir.join("snap_GONE.json"), b"{}").unwrap();
     age_file(&dir.join("snap_GONE.json"), 2 * 24 * 3600);
-    std::fs::write(dir.join("snap_KEEP.tar.gz"), b"archive").unwrap();
+    write_valid_archive(&dir, "snap_KEEP", b"archive contents");
     std::fs::write(
         dir.join("snap_KEEP.json"),
         serde_json::to_string(&sidecar_info("snap_KEEP")).unwrap(),
     )
     .unwrap();
+    age_file(&dir.join("snap_KEEP.tar.gz"), 2 * 24 * 3600);
+    age_file(&dir.join("snap_KEEP.json"), 2 * 24 * 3600);
+    std::fs::write(dir.join("snap_BAD.tar.gz"), b"not gzip").unwrap();
+    std::fs::write(
+        dir.join("snap_BAD.json"),
+        serde_json::to_vec(&sidecar_info("snap_BAD")).unwrap(),
+    )
+    .unwrap();
+    age_file(&dir.join("snap_BAD.tar.gz"), 2 * 24 * 3600);
+    age_file(&dir.join("snap_BAD.json"), 2 * 24 * 3600);
 
     let svc = MemoryService::new(cfg).unwrap();
     svc.write("note.md", "survives", false).unwrap();
@@ -623,6 +1125,11 @@ fn reclaim_sweep_at_mount_open_does_not_block_or_delete_live_data() {
     assert!(!dir.join("snap_GONE.json").exists());
     assert!(dir.join("snap_KEEP.tar.gz").exists());
     assert!(dir.join("snap_KEEP.json").exists());
+    assert!(!dir.join("snap_BAD.tar.gz").exists());
+    assert!(!dir.join("snap_BAD.json").exists());
+    let list = svc.mem_snapshot_list().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, "snap_KEEP");
 }
 
 #[test]

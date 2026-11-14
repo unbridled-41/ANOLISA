@@ -1,3 +1,6 @@
+pub(crate) mod atomic_write;
+pub(crate) use atomic_write::write_config_atomically;
+
 use anyhow::Context;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -36,6 +39,8 @@ pub const ENFORCEMENT_DB_NAME: &str = "enforcement.db";
 pub const REUSE_DB_NAME: &str = "reuse.db";
 /// Private causal analysis database filename.
 pub const CAUSAL_DB_NAME: &str = "causal.db";
+/// Learned static-SSL offset cache filename.
+pub const SSL_OFFSETS_LEARNED_NAME: &str = "ssl_offsets_learned.json";
 
 /// Default audit table name.
 pub const DEFAULT_AUDIT_TABLE: &str = "audit_events";
@@ -160,6 +165,34 @@ pub fn set_poll_timeout_ms(ms: u64) {
 /// Current ring-buffer poll timeout (milliseconds).
 pub fn poll_timeout_ms() -> u64 {
     POLL_TIMEOUT_MS.load(Ordering::SeqCst)
+}
+
+// ==================== Global Learned SSL Offset Cache Path ====================
+
+/// Process-wide location of the learned static-SSL offset cache, published
+/// by `AgentSight::new` from [`StorageConfig::ssl_offsets_learned_path`].
+///
+/// `SslSniff::build` loads the cache from code that cannot see the config
+/// object — the same publication pattern as the poll timeout above.
+static SSL_OFFSETS_LEARNED_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Publish where the learned static-SSL offset cache lives.
+pub fn set_ssl_offsets_learned_path(path: PathBuf) {
+    *SSL_OFFSETS_LEARNED_PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+}
+
+/// Current learned static-SSL offset cache path.
+///
+/// Falls back to the default storage directory when never published
+/// (standalone probe binaries that do not load the full config).
+pub fn ssl_offsets_learned_path() -> PathBuf {
+    SSL_OFFSETS_LEARNED_PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| default_base_path().join(SSL_OFFSETS_LEARNED_NAME))
 }
 
 // ==================== Global HTTP Trace Duration Floor ====================
@@ -450,6 +483,11 @@ impl StorageConfig {
     /// Returns the fixed path of the optimization database.
     pub fn optimization_path(&self) -> PathBuf {
         self.base_path.join(OPTIMIZATION_DB_NAME)
+    }
+
+    /// Returns the fixed path of the learned static-SSL offset cache.
+    pub fn ssl_offsets_learned_path(&self) -> PathBuf {
+        self.base_path.join(SSL_OFFSETS_LEARNED_NAME)
     }
 
     pub(crate) fn validate_total_size_mb(max_total_size_mb: u64) -> Result<(), String> {
@@ -848,71 +886,6 @@ pub fn parse_json_rules(
     let parsed: JsonFullConfig = serde_json::from_str(strip_leading_bom(json))
         .map_err(|e| format!("JSON parse error: {e}"))?;
     Ok(extract_rules(&parsed))
-}
-
-pub(crate) fn write_config_atomically(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    let destination = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::canonicalize(path) {
-            Ok(target) => target,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let target = std::fs::read_link(path)?;
-                if target.is_absolute() {
-                    target
-                } else {
-                    path.parent().unwrap_or_else(|| Path::new(".")).join(target)
-                }
-            }
-            Err(error) => return Err(error),
-        },
-        Ok(_) => path.to_path_buf(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(error) => return Err(error),
-    };
-    let permissions = match std::fs::metadata(&destination) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-
-    for _ in 0..64 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            destination.with_extension(format!("tmp.{}.{}", std::process::id(), sequence));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-
-        let write_result = (|| {
-            if let Some(permissions) = &permissions {
-                file.set_permissions(permissions.clone())?;
-            }
-            file.write_all(content.as_bytes())?;
-            file.sync_all()
-        })();
-        drop(file);
-        // A same-directory rename exposes either complete generation, never
-        // the truncate-then-write window to a concurrent trace/serve worker.
-        let result = write_result.and_then(|()| std::fs::rename(&temporary, &destination));
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        return result;
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("Failed to allocate a temporary config file next to {path:?}"),
-    ))
 }
 
 /// Ensure the agents configuration file exists and is up to date.
@@ -1543,7 +1516,19 @@ impl AgentsightConfig {
     /// Load configuration from a JSON string, appending rules to existing ones.
     ///
     /// Parses `verbose`, `log_path`, `cmdline`, `https` and `http` fields.
+    ///
+    /// A rejected document leaves the configuration untouched. Callers keep
+    /// using the previous values when this returns an error, so a field that
+    /// was parsed before the failing one must not take effect.
     pub fn load_from_json(&mut self, json: &str) -> Result<(), String> {
+        let mut next = self.clone();
+        next.apply_json_fields(json)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Apply one parsed document to this configuration.
+    fn apply_json_fields(&mut self, json: &str) -> Result<(), String> {
         // The --config and FFI `load_config()` entry point: one leading BOM
         // (see [`strip_leading_bom`]) must not fail the whole load and leave
         // the tracer on embedded defaults without the user's rules.
@@ -2139,6 +2124,32 @@ mod tests {
         config
             .load_from_json(r#"{"storage":{"max_total_size_mb":0}}"#)
             .unwrap();
+    }
+
+    /// A rejected document must not leave the fields parsed before the
+    /// failing one in effect: the caller reports the error and continues on
+    /// the previous configuration, so a typo in `storage` must not also flip
+    /// the content-upload switch or the cgroup filter.
+    #[test]
+    fn a_rejected_document_leaves_the_configuration_unchanged() {
+        let mut config = AgentsightConfig::new();
+        assert!(!config.trace_enabled);
+        assert!(!config.cgroup_filter_enabled);
+
+        let error = config
+            .load_from_json(
+                r#"{
+                    "schema_version": 6,
+                    "traceEnabled": true,
+                    "cgroup_filter_enabled": true,
+                    "storage": {"max_total_size_mb": 8}
+                }"#,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("must be zero or at least 9"));
+        assert!(!config.trace_enabled);
+        assert!(!config.cgroup_filter_enabled);
     }
 
     #[test]
@@ -2904,6 +2915,29 @@ mod tests {
         let mut config = AgentsightConfig::new();
         config.load_from_json(json).unwrap();
         assert!(!config.server_auth.enabled);
+    }
+
+    #[test]
+    fn storage_learned_offsets_path_follows_base_path() {
+        let storage = StorageConfig::default();
+        assert_eq!(
+            storage.ssl_offsets_learned_path(),
+            storage.base_path.join(SSL_OFFSETS_LEARNED_NAME)
+        );
+    }
+
+    #[test]
+    fn learned_offsets_path_falls_back_until_published() {
+        // Nothing publishes the global in a default `cargo test` run (the
+        // BPF-gated publishers are #[ignore]d), so the fallback is observable
+        // here; `AgentSight::new` publishes the configured path in production.
+        assert_eq!(
+            ssl_offsets_learned_path(),
+            default_base_path().join(SSL_OFFSETS_LEARNED_NAME)
+        );
+        let published = unique_temp_dir().join(SSL_OFFSETS_LEARNED_NAME);
+        set_ssl_offsets_learned_path(published.clone());
+        assert_eq!(ssl_offsets_learned_path(), published);
     }
 
     // ── schema_version / config upgrade ─────────────────────────────────

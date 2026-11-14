@@ -10,7 +10,7 @@ This workspace slice contains the dependency-light contracts, Policy
 Administration Point, first-version PAP daemon protocol, Policy-template
 validation, protocol-independent Unix-domain-socket service framework, and runnable
 foreground process bootstrap, together with a PEP Translator for native JSON
-file-deletion rules and Cedar deletion/ordinary-write restrictions, and an
+file-deletion rules and Cedar deletion/ordinary-write/exact-file read restrictions, and an
 independent Deployment Client. `asc-pcp` provides synchronous attempts and
 `asc-policy-runtime/src/reconciliation/` provides the bounded Binding queue,
 workers, retry timers and compensation scanning. The daemon stores Policy, Scope
@@ -69,11 +69,18 @@ permission format and the [execution design](../docs/design/LINUX_SANDBOX_PEP_DE
 for preparation, installation and process-lifetime boundaries.
 
 `asc-pep-runtime::PepRuntime` adds authorization for embedding applications through
-`DaemonAuthorizationClient`. The daemon reads current PAP-selected Cedar policies,
+`DaemonAuthorizationClient`. The daemon reads PAP's current effective Cedar policy set,
 returns ALLOW/DENY/MODIFY/STEP_UP/DEFER, and records owner-bound execution receipts
 through `authorization.evaluate` and `authorization.report`. Approval remains in
-the application, and execution uses the same local backend. `--authorization-config`
-selects Policy IDs and an OS-permission ceiling; it does not load policy snapshot files.
+the application, and execution uses the same local backend. PAP includes Cedar sources
+whose statements all have explicit principal headers; Cedar matches the request against
+the combined set independently of Scope/Binding assignments. Authorization is always
+enabled; an empty set denies requests. There is no separate authorization configuration
+or environment-permission ceiling. A decision must be accepted within 60 seconds.
+Remove the old `--authorization-config` argument when upgrading and express shared
+restrictions in PAP-managed Cedar. Review the old baseline/task intersection semantics
+before adapting request policies to the combined set; see the
+[sandbox guide](../../../docs/user-guide/en/agent-sec-core/sandbox.md) for migration.
 
 The current crates are:
 
@@ -84,23 +91,27 @@ The current crates are:
 - `asc-os-permission-types`: the versioned OS permission set.
 - `asc-sandbox-types`: local invocation, path identities, mount plan and backend results.
 - Runtime requests, decisions and receipts live in `asc-daemon-protocol::authorization`.
+  `AuthorizationRequest<C>` carries principal/action/resource entity references and
+  a consumer-specific context. `OsAuthorizationRequest` binds the OS context to
+  `process.spawn`; the current daemon evaluates only this specialization.
 - `asc-pep-runtime`: command and path preparation, strict sandbox execution and
   installation-handshake supervision, plus upper-PEP authorization, approval and
   receipt handling for embedding applications.
-- `asc-pdp-runtime`: OS request evaluation using Cedar, policy-range intersection,
-  advice handling and five-state decisions under the requested and environment limits.
+- `asc-pdp-runtime`: OS request evaluation over a combined Cedar policy set, advice
+  handling and five-state decisions within the requested permissions.
+  `from_policy_set` is the sole policy-loading API.
 - `asc-policy-cedar`: library-only Cedar frontend with a pinned file/process and
   whole-network permission schema, strict SDK validation, common-subset checks
   through `validate` and official typed PST output through `pst`. Agent Hook
   actions can add separate typed contexts.
   PAP/RPC and SQLite retain validated source and exact schema references. Revision 1
   supports logical subjects, program calls and permit advice for sandbox authorization.
-  The AgentSight adapter translates and deploys supported deletion and write rules. See the
+  The AgentSight adapter translates and deploys supported deletion, write and exact-file read rules. See the
   [frontend contract and tests](../docs/design/POLICY_FRONTEND_AST_AND_TRANSLATION.md#86-cedar-frontend-library).
 - `asc-policy-translator-agentsight`: translates immutable Binding snapshots into
   target plans. Native JSON supports block + file/write + operation=delete without
   history and produces DSL; Cedar supports a bounded `forbid` subset for deletion
-  and ordinary writes and produces structured file-protection JSON. Unsupported
+  and ordinary writes plus exact-file read denial, producing structured file-protection JSON. Unsupported
   rules reject the entire translation. Backend validation occurs at deployment.
 - `asc-agentsight-client`: health-gated AgentSight apply/delete transport for
   one configured endpoint, with process identity resolution and complete HTTP
@@ -146,7 +157,7 @@ The current crates are:
   injects concrete adapters into the daemon service.
 - `asc-model-client`: shared loopback client for local inference (Ollama),
   plus an explicitly configured HTTPS OpenAI-compatible provider for Intent.
-- `asc-intent`: task-to-Cedar generation against the unified schema with official
+- `asc-intent`: task/command-to-Cedar generation against the unified schema with official
   parsing, canonical absolute-path checks and Strict validation. It does not
   approve, persist, deploy or enforce candidates.
 - `asc-capability-prompt-scan`: prompt injection/jailbreak scanner combining
@@ -175,7 +186,7 @@ which directly returns Cedar against the unified schema. The response
 is exactly `{"policy":"...","unresolved":[]}`. The unconfirmed draft preserves
 that response and task provenance; it does not grant authorization.
 
-There are no path inputs: the request carries only the task text and a TTL.
+The task proposal has no path inputs: its request carries only the task text and a TTL.
 No file contents, directory listings or Git changes are read, and the daemon does
 not open caller paths. The model resolves absolute paths from the task itself; a
 relative or ambiguous target goes into `unresolved`. Nothing is appended to the
@@ -213,14 +224,56 @@ downstream; this path does not connect to PAP.
 See [the Intent reference](../../../docs/user-guide/en/agent-sec-core/policy-cli.md#intent-propose-a-candidate-from-a-task)
 for configuration, constraints and output semantics.
 
+### Command Cedar API
+
+For hook integrations, `intent.propose_command` accepts existing command/cwd values
+and returns unapproved Cedar, without requiring a base policy or changing the hook.
+This is a V2 API addition in the source tree, not an integrated sandbox workflow.
+
+```json
+{"method":"intent.propose_command","params":{"format_version":"asc.intent.command.request.v1","command":"read -r line < report.csv","cwd":"/work"}}
+```
+
+The result is `{"outcome":"candidate","policy":"Cedar text"}` or
+`{"outcome":"needs_clarification","reasons":["missing information"]}`. Any
+model-reported ambiguity discards the partial policy. Empty Cedar requests no permissions.
+The API validates Cedar syntax, paths and types, but cannot prove that the model
+identified every required operation or chose minimal permissions. The API itself emits no
+`requested_permissions`, reads or rewrites no base policy, and calculates no effective
+permissions. It publishes no policy and executes no command either, so PDP mapping, approval
+and hook/sandbox integration remain separate work.
+
+The Rust entry point is `asc_intent::propose_command` with `CommandInput { command, cwd }`.
+The RPC uses the existing Intent model configuration, authenticated LocalUser access,
+shared per-UID/global concurrency limits and 35-second dispatch budget. Command/cwd
+are sent to the configured model service and can contain sensitive data or incur charges.
+`agent-sec-cli intent propose-command --command <text> [--cwd <dir>]` wraps the RPC for
+hook callers, defaults to JSON output and keeps `--format text|cedar`; `--format text`
+groups permissions as read/write/exec/spawn/network and falls back to the exact Cedar
+when a condition cannot be summarized. `--format cedar` prints the unapproved candidate with
+its caveats as comments, and that text is the artifact a later approval step consumes. The
+candidate covers only the command's own demand, so the program, cwd and loader paths are still
+not included; the CLI adds none of them.
+The PDP restricts every request to the PAP-managed Cedar policy set.
+A candidate returns determinable permissions
+plus non-blocking `caveats` for gaps such as an unresolved PATH lookup or unknown
+script behavior; only an inexpressible command yields a clarification, and an empty policy is a
+candidate as well: a command with no file, process or network action grants nothing and keeps
+its caveats instead of becoming a question. There is no TTL.
+See the
+[command contract (Chinese)](../docs/design/DAEMON_PROTOCOL_V1_zh.md#191-target-v2已实现-单次命令-cedar-api)
+for field budgets and errors, plus the offline `command_api_*` daemon and `command_*`
+CLI tests.
+
 ### Intent source layout
 
-`asc-intent/src/` contains four Rust files:
+`asc-intent/src/` contains five Rust files:
 
 - `lib.rs`: public entry points and module declarations.
-- `intent_extraction.rs`: task-only model input, response parsing and traceable Cedar draft.
+- `intent_extraction.rs`: task or command/cwd model input, command prompt, response parsing and task drafts.
 - `policy_validation.rs`: native Cedar/path checks, escaping and Strict validation.
-- `policy_generator.rs`: orchestration, candidate TTL, complete hashes and safety notes.
+- `policy_summary.rs`: read/write/exec/spawn/network summary for `--format text`; presentation only, never an authorization result.
+- `policy_generator.rs`: command outcomes and task candidate orchestration, TTL, hashes and safety notes.
 
 The generation instructions in `asc-intent/prompts/policy-generation.md` are
 embedded at build time. Entity, action and field semantics come from the embedded
@@ -312,7 +365,7 @@ source decoder reads historical native Policy, Scope and Binding snapshots.
 Native serialization and SQLite storage version 1 are retained. Saved Cedar
 source can be passed to the existing `asc-policy-cedar::pst` entrypoint to
 regenerate the official PST under its saved schema. The PEP Translator supports
-Cedar `forbid` deletion/ordinary-write restrictions; unsupported semantics reject
+Cedar `forbid` deletion/ordinary-write/exact-file read restrictions; unsupported semantics reject
 the entire translation. The Deployment Client checks capabilities and applies the plan.
 
 The current bootstrap bounds frame read, application dispatch, rejection

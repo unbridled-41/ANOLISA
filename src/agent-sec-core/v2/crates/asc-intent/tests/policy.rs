@@ -2,9 +2,9 @@
 //! file, program or network operation.
 
 use asc_intent::{
-    CANDIDATE_VERSION, CEDAR_SCHEMA, CandidatePolicy, DRAFT_VERSION, INTENT_BUDGET,
+    CANDIDATE_VERSION, CEDAR_SCHEMA, CandidatePolicy, DRAFT_VERSION, INTENT_BUDGET, IntentSpec,
     MAX_POLICY_BYTES, PROMPT_VERSION, PolicyError, ProposalContext, ProposalError, ProposalOutcome,
-    TaskInput, prepare_policy, propose_task, validate_policy_response,
+    TaskInput, compile_spec, prepare_policy, propose_task, validate_policy_response,
 };
 use asc_model_client::provider::{FakeProvider, ModelProvider, ProviderError};
 use cedar_policy::{
@@ -123,6 +123,76 @@ impl Judge {
         self.check("file.write", path, write_context(op), expected);
     }
 }
+#[test]
+fn init_subtrees_include_roots_and_preserve_boundaries() {
+    for suffix in ["*", "**"] {
+        let allow = vec![format!("/data/{suffix}")];
+        let deny = vec![format!("/data/secrets/{suffix}")];
+        let spec = IntentSpec {
+            allow_read: allow.clone(),
+            allow_write: allow.clone(),
+            allow_exec: allow,
+            deny_read: deny.clone(),
+            deny_write: deny.clone(),
+            deny_exec: deny,
+            programs: vec!["/bin/test".into()],
+            ..IntentSpec::default()
+        };
+        let judge = Judge::new(&compile_spec(&spec).unwrap().text);
+        for (path, expected) in [
+            ("/data/secrets", Decision::Deny),
+            ("/data/secrets/token", Decision::Deny),
+            ("/data/secrets/nested/token", Decision::Deny),
+            ("/data", Decision::Allow),
+            ("/data/public", Decision::Allow),
+            ("/data/secrets-backup", Decision::Allow),
+            ("/data/secrets-backup/token", Decision::Allow),
+            ("/data/secrets2/token", Decision::Allow),
+            ("/database", Decision::Deny),
+            ("/database/token", Decision::Deny),
+        ] {
+            judge.read(path, expected);
+            for operation in ["write", "create", "delete", "rename", "setattr"] {
+                judge.write(path, operation, expected);
+            }
+            judge.check("file.exec", path, exec_context("/", &[]), expected);
+        }
+        // The root and descendant alternatives must both stay program-scoped: the joining `||`
+        // must not lift a path match out of the `&&`.
+        for path in ["/data", "/data/public"] {
+            judge.check(
+                "file.read",
+                path,
+                json!({"input":{"program":"/bin/other"}}),
+                Decision::Deny,
+            );
+            let mut context = write_context("rename");
+            context["input"]["program"] = json!("/bin/other");
+            judge.check("file.write", path, context, Decision::Deny);
+        }
+
+        let mut root = IntentSpec {
+            allow_write: vec![format!("/{suffix}")],
+            ..IntentSpec::default()
+        };
+        let allowed = Judge::new(&compile_spec(&root).unwrap().text);
+        root.deny_write = root.allow_write.clone();
+        let denied = Judge::new(&compile_spec(&root).unwrap().text);
+        for path in ["/", "/data", "/data/nested/token"] {
+            allowed.write(path, "rename", Decision::Allow);
+            denied.write(path, "rename", Decision::Deny);
+        }
+    }
+    // A root path without a subtree suffix still matches only itself.
+    let exact = IntentSpec {
+        allow_write: vec!["/".into()],
+        ..IntentSpec::default()
+    };
+    let judge = Judge::new(&compile_spec(&exact).unwrap().text);
+    judge.write("/", "rename", Decision::Allow);
+    judge.write("/data", "rename", Decision::Deny);
+}
+
 fn json_hash(value: &Value) -> String {
     fn sort(value: &mut Value) {
         match value {
@@ -197,6 +267,7 @@ fn direct_cedar_generation_and_model_boundaries() {
     literal_and_root_paths();
     condition_and_exclusive_boundaries();
     invalid_and_unsupported();
+    process_program_attribute();
     unresolved_is_not_a_completeness_proof();
     exact_delete_matrix();
     input_budgets_and_deadlines();
@@ -434,6 +505,44 @@ fn invalid_and_unsupported() {
     assert!(matches!(
         prepare_policy(&"permit(principal, action, resource);\n".repeat(1025)),
         Err(PolicyError::TooLarge)
+    ));
+}
+
+fn process_program_attribute() {
+    // A `like` pattern written as an equality literal names no concrete path and would not
+    // project, so it gets its own reason the model can act on.
+    for expression in ["resource.path == \"/a/*\"", "resource.path != \"/a/*\""] {
+        let policy = format!(
+            "permit(principal, action == SecCore::Action::\"file.read\", resource is SecCore::File) when {{ {expression} }};"
+        );
+        assert!(
+            matches!(prepare_policy(&policy), Err(PolicyError::WildcardLiteral)),
+            "{policy}"
+        );
+    }
+    // `SecCore::Process.program` is a command name supplied by the request, not a path, so it
+    // keeps no absolute-literal rule; only a projection through a record hides the receiver.
+    for policy in [
+        "permit(principal, action == SecCore::Action::\"process.spawn\", resource is SecCore::Process)\nwhen { resource.program == \"git\" };"
+            .to_owned(),
+        "permit(principal, action == SecCore::Action::\"process.spawn\", resource is SecCore::Process)\nwhen { resource.program != \"git\" };".to_owned(),
+        "permit(principal, action == SecCore::Action::\"process.spawn\", resource is SecCore::Process)\nwhen { resource.resolved_program == \"/usr/bin/git\" };".to_owned(),
+    ] {
+        assert!(prepare_policy(&policy).is_ok(), "{policy}");
+    }
+    let projected = "{r: resource}.r.program == \"git\"";
+    let policy = format!(
+        "permit(principal, action == SecCore::Action::\"process.spawn\", resource is SecCore::Process) when {{ {projected} }};"
+    );
+    assert!(
+        matches!(prepare_policy(&policy), Err(PolicyError::InvalidPath)),
+        "{policy}"
+    );
+    // The request context program stays an executable path and keeps the absolute-literal rule.
+    let context_program = "permit(principal, action == SecCore::Action::\"file.read\", resource is SecCore::File)\nwhen { context.input.program == \"git\" };";
+    assert!(matches!(
+        prepare_policy(context_program),
+        Err(PolicyError::InvalidPath)
     ));
 }
 

@@ -9,6 +9,49 @@
 
 ## [未发布]
 
+## [0.7.0] - 2026-11-12
+
+### 移除
+
+- 为聚焦系统运维，将八个通用技能移出默认技能包，并结束对内置副本的常规维护。
+  仍需这些能力的用户可使用上游技能、工具或官方文档：
+  - `github` — 通用 GitHub CLI 工作流，参见 GitHub CLI 技能
+  - `humanizer` — 写作指导，按需加载上游 Humanizer 技能
+  - `image-gen` — 通用图像生成，百炼接入交由使用它的产品维护
+  - `pdf-reader` — 通用 PDF 读取，由宿主工具 / PyMuPDF 适配提供
+  - `xlsx` — 通用表格，已由 MiniMax XLSX 技能覆盖
+  - `regex-mastery` — 通用正则指南，按需加载上游指南
+  - `shell-scripting` — 通用 Shell 脚本，由上游项目提供
+  - `upgrade-alinux-kernel` — ALinux 专用内核升级，交由发行版维护方
+- 移除 `pdf-reader` 与 `xlsx` 的配套回归测试，以及不再使用的 PyMuPDF 测试依赖。
+- 从 `alinux-admin` 的依赖列表移除已退场的 `shell-scripting`；其自带的 Shell
+  参考文档保持不变。
+
+## [0.6.6] - 2026-11-12
+
+### 变更
+
+- 源码安装会把自身安装的 Skill 目录记录到安装清单中，`make uninstall` 只删除清单
+  记录的目录，手动添加或由其他安装器放入的同名 Skill 不再被静默删除；
+  `make install` 也不再覆盖未记录的同名目录，除非传入 `REPLACE_UNOWNED=1`。
+  本次发布之前安装的集合没有安装清单，首次升级需执行
+  `REPLACE_UNOWNED=1 make install`，否则安装与卸载都会报错停止 (#9886)
+- 当安装路径仍由 `HOME` 推导时，`make install INSTALL_PROFILE=user` 在 `HOME`
+  未设置、为空、为 `/` 或为相对路径时拒绝执行，不再静默写入
+  `/.copilot-shell/skills`；显式传入 `PREFIX`、`DATADIR` 和 `SKILLS_DIR` 时仍可在
+  没有家目录的环境中安装 (#9886)
+
+### 修复
+
+- `install-openclaw` Skill 以 `0600` 权限写入 `openclaw.json`（其中以明文保存 API
+  Key）、其备份、`identity/device-auth.json` 与 `devices/paired.json`，本地其他用户
+  不再能读取 operator token，重复执行也不会把加固过的配置权限降回 `0644` (#7846)
+- `aliyun-ecs` Skill 中的 `DeleteKeyPairs --KeyPairNames` 示例改为 API 要求的数组
+  形式，示例命令不再被参数校验拒绝 (#9547)
+- `kernel-dev` Skill 的 `check-env.sh` 不再把 `kernel-build-dir` 伪包混入
+  `yum install` 提示，避免 dnf 环境下整条安装事务失败；缺失的软件包与缺失的内核
+  构建目录改为分行提示 (#7922)
+
 ## [0.6.5] - 2026-11-09
 
 ### 变更

@@ -41,11 +41,12 @@ pub(super) fn callback(args: &Arguments) -> Exit {
             {
                 return Exit::Code(1);
             }
-            let blocked = args
-                .flags
-                .get("--event")
-                .is_some_and(|v| matches!(v.as_str(), "input.submit" | "tool.before"))
-                && args.flags.get("--on-error").is_some_and(|v| v == "block");
+            let blocked = args.flags.get("--event").is_some_and(|v| {
+                matches!(
+                    v.as_str(),
+                    "input.submit" | "tool.before" | "security.violation"
+                )
+            }) && args.flags.get("--on-error").is_some_and(|v| v == "block");
             match emit(adapter.reply(blocked)) {
                 Ok(exit) => exit,
                 Err(error) => {
@@ -157,10 +158,7 @@ pub(super) fn invoke_bound(
         input,
         route.replacement_step.is_some(),
     )?;
-    let client = Client::connect(&binding.socket, deadline)?;
-    if client.identity() != &binding.binding.identity {
-        return Err("stale hook binding".into());
-    }
+    let client = Client::from_identity(&binding.socket, binding.binding.identity.clone());
     if close {
         let session_id = normalized["session_id"]
             .as_str()

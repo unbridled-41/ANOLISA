@@ -1,17 +1,17 @@
 //! An explicit upper-PEP consumer; the product sandbox CLI remains daemon-independent.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use asc_daemon_protocol::authorization::{
-    AgentPrincipal, AuthorizationRequest, Decision, ExecutionReceipt, OsPermissionSet, ReceiptAck,
+    AgentPrincipal, Decision, ExecutionReceipt, OsAuthorizationRequest, ReceiptAck,
 };
 use asc_pep_runtime::{
-    ApprovalHandler, AuthorizationClient, DaemonAuthorizationClient, FixedPermissions, PepError,
-    PepRuntime, SandboxBackend, prepare_launch,
+    ApprovalHandler, AuthorizationClient, DaemonAuthorizationClient, PepError, PepRuntime,
+    PermissionInput, SandboxBackend, prepare_launch,
 };
 use clap::Parser;
 
@@ -24,12 +24,9 @@ struct Options {
     /// Root-owned daemon socket.
     #[arg(long)]
     socket: PathBuf,
-    /// JSON OS permission request, including runtime dependencies.
+    /// OS permission JSON or Cedar request source, including runtime dependencies.
     #[arg(long)]
     permissions: PathBuf,
-    /// Logical Agent identity supplied by the embedding application.
-    #[arg(long)]
-    agent_id: String,
     /// Agent family, such as codex or qoder.
     #[arg(long)]
     agent_type: String,
@@ -44,7 +41,7 @@ struct Options {
 struct LocalClient(DaemonAuthorizationClient);
 
 impl AuthorizationClient for LocalClient {
-    fn evaluate(&self, request: &AuthorizationRequest) -> Result<Decision, PepError> {
+    fn evaluate(&self, request: &OsAuthorizationRequest) -> Result<Decision, PepError> {
         let decision = self.0.evaluate(request)?;
         for warning in &decision.warnings {
             eprintln!("POLICY_WARNING {warning}");
@@ -78,8 +75,11 @@ impl ApprovalHandler for LocalApproval {
 }
 
 fn run(options: Options) -> Result<u8, Box<dyn std::error::Error>> {
-    let permissions: OsPermissionSet =
-        serde_json::from_reader(std::fs::File::open(options.permissions)?)?;
+    let mut text = String::new();
+    std::fs::File::open(options.permissions)?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)?;
+    let permissions = PermissionInput::parse(&text)?;
     let (program, args) = options
         .command
         .split_first()
@@ -112,11 +112,10 @@ fn run(options: Options) -> Result<u8, Box<dyn std::error::Error>> {
         .then_some(&mut approval as &mut dyn ApprovalHandler);
     let outcome = runtime.run(
         &AgentPrincipal {
-            agent_id: options.agent_id,
-            agent_type: options.agent_type,
+            agent_type: Some(options.agent_type),
         },
         launch,
-        &FixedPermissions(permissions),
+        &permissions,
         &client,
         channel,
     )?;

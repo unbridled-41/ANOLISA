@@ -512,19 +512,20 @@ fn kongche_cancel_and_suppression_have_one_terminal_notice() {
                 if choice == 1 { b"\n" } else { b"2\n" },
             ));
         }
-        let final_notice = if choice == 2 {
-            "Automatic OS Console access disabled."
-        } else {
-            "Cancelled. Your question is retained"
+        let final_notice = match choice {
+            0 => "Cancelled. Your question is retained",
+            1 => "Automatic access is disabled for this session.",
+            _ => "Automatic OS Console access disabled.",
         };
         steps.push((final_notice, b"printf 'KONGCHE_%s\n' CANCEL_DONE\n"));
         steps.push(("KONGCHE_CANCEL_DONE", b""));
         let (output, requests) = run_trial(&[], &steps);
         assert_eq!(
             output.matches("Cancelled.").count(),
-            usize::from(choice != 2),
+            usize::from(choice == 0),
             "{output}"
         );
+        assert_eq!(output.matches(final_notice).count(), 1, "{output}");
         assert_eq!(
             requests
                 .iter()
@@ -534,4 +535,43 @@ fn kongche_cancel_and_suppression_have_one_terminal_notice() {
             "{requests:?}"
         );
     }
+}
+
+#[test]
+fn explicit_ask_reaches_core_trial_without_proactive_auth_registry_probe() {
+    let home = tempfile::tempdir().unwrap();
+    let core = home.path().join("trial-core");
+    let log = home.path().join("trial.log");
+    write_executable(&core, CORE);
+    fs::write(home.path().join(".bashrc"), "COSH_RC_PROBE=loaded\n").unwrap();
+    let output = super::passthrough::interactive_pty_probe_with_env(
+        env!("CARGO_BIN_EXE_cosh-shell"),
+        &["raw", "cosh-core", "--ask", "Check current memory pressure"],
+        home.path(),
+        "trial answer automatically resumed",
+        "__DONE__<loaded>",
+        &[
+            ("COSH_CORE_PATH", core.to_str().unwrap()),
+            ("TRIAL_LOG", log.to_str().unwrap()),
+            ("TRIAL_AUTO_READY", "1"),
+            ("COSH_SHELL_STARTUP_BANNER", "1"),
+        ],
+    );
+    let requests: Vec<serde_json::Value> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let users: Vec<_> = requests
+        .iter()
+        .filter(|request| request["type"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1, "{requests:?}\n{output}");
+    assert_eq!(users[0]["ecs_trial_context"]["intent"], "user_initiated");
+    assert_eq!(users[0]["ecs_trial_context"]["schema_version"], 1);
+    assert!(
+        !requests.iter().any(|request| request["action"] == "state"),
+        "{requests:?}"
+    );
+    assert!(!output.contains("No provider"), "{output}");
 }

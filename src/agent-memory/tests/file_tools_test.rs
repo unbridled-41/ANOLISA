@@ -308,6 +308,59 @@ fn list_caps_entries_at_max() {
     );
 }
 
+#[test]
+fn list_warns_only_when_matching_entries_exceed_cap() {
+    for glob in [None, Some("**/*.md".to_string())] {
+        let (tmp, svc) = setup();
+        let bulk = tmp.path().join("user-tester/bulk");
+        std::fs::create_dir_all(&bulk).unwrap();
+        for i in 0..4999 {
+            std::fs::File::create(bulk.join(format!("f{i:05}.md"))).unwrap();
+        }
+        if glob.is_some() {
+            // Extra filesystem entries do not imply extra matching results.
+            std::fs::File::create(bulk.join("ignored.txt")).unwrap();
+        }
+
+        for count in 4999..=5001 {
+            if count > 4999 {
+                std::fs::File::create(bulk.join(format!("f{:05}.md", count - 1))).unwrap();
+            }
+            for recursive in [false, true] {
+                let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = captured.clone();
+                let guard = tracing_subscriber::fmt()
+                    .with_writer(move || CaptureWriter(sink.clone()))
+                    .with_ansi(false)
+                    .set_default();
+                let entries = svc
+                    .list(
+                        "bulk",
+                        ListOptions {
+                            recursive,
+                            glob: glob.clone(),
+                        },
+                    )
+                    .unwrap();
+                drop(guard);
+
+                assert_eq!(entries.len(), count.min(5000));
+                assert!(entries.iter().all(|entry| entry.path.ends_with(".md")));
+                let logged =
+                    String::from_utf8(std::mem::take(&mut *captured.lock().unwrap())).unwrap();
+                assert_eq!(
+                    logged.contains("listing truncated"),
+                    count > 5000,
+                    "count={count}, recursive={recursive}, glob={glob:?}: {logged}"
+                );
+                if count > 5000 {
+                    assert!(logged.contains("under 'bulk'"), "{logged}");
+                }
+            }
+        }
+    }
+}
+
 // ---------- mem_grep ----------
 
 #[test]
@@ -327,6 +380,53 @@ fn grep_finds_matches_with_line_numbers() {
     assert_eq!(hits[0].path, "notes/a.md");
     assert_eq!(hits[0].line, 2);
     assert!(hits[0].text.contains("hello"));
+}
+
+#[test]
+fn grep_skips_invalid_utf8_lines_and_keeps_physical_line_numbers() {
+    let (_t, svc) = setup();
+    let notes = svc.mount.root.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let cases = [
+        (
+            b"alpha first\n\xff\xfe alpha bad\nomega last\n".as_slice(),
+            vec![(1, "alpha first"), (3, "omega last")],
+        ),
+        (
+            b"\xff alpha bad\r\n\xfe omega bad\r\n\r\nalpha first\r\nomega last".as_slice(),
+            vec![(4, "alpha first"), (5, "omega last")],
+        ),
+        (
+            b"alpha first\n\xe4\xb8".as_slice(),
+            vec![(1, "alpha first")],
+        ),
+        (b"\xff alpha bad\n\xfe omega bad".as_slice(), vec![]),
+        (
+            "alpha 中文\n\nomega 最后".as_bytes(),
+            vec![(1, "alpha 中文"), (3, "omega 最后")],
+        ),
+    ];
+
+    for (content, expected) in cases {
+        std::fs::write(notes.join("mixed.md"), content).unwrap();
+        let hits = svc
+            .grep(
+                "alpha|omega",
+                GrepOptions {
+                    dir: "notes".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for hit in &hits {
+            assert_eq!(hit.path, "notes/mixed.md");
+        }
+        let actual: Vec<_> = hits
+            .iter()
+            .map(|hit| (hit.line, hit.text.as_str()))
+            .collect();
+        assert_eq!(actual, expected, "input: {content:?}");
+    }
 }
 
 #[test]

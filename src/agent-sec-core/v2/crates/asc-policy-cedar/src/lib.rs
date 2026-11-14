@@ -7,6 +7,7 @@
 
 pub mod advice;
 pub mod default_policy;
+pub mod http;
 pub mod schema;
 mod validation;
 
@@ -15,16 +16,45 @@ use cedar_policy::ValidationWarning;
 
 /// Validates source for policy creation and returns non-blocking SDK warnings.
 ///
-/// Accepts schema-valid subjects and supported permit advice. Each translator
-/// checks which rules its target can enforce.
-/// Validation inspects the parsed AST without generating a PST.
+/// Accepts schema-valid subjects and supported permit advice. Credential-annotated
+/// sets additionally require exact, bounded HTTP lowering; other translators
+/// check which rules their targets can enforce.
 ///
 /// # Errors
 /// Returns envelope, schema-resolution, parse, common-subset or validation errors.
 /// Action applicability warnings also reject the entire policy set.
 pub fn validate(source: &CedarPolicySource) -> Result<Vec<ValidationWarning>, CedarError> {
-    let (_, warnings) = validation::parse_and_validate(source)?;
+    let (_, warnings, _) = validation::parse_and_validate(source)?;
     Ok(warnings)
+}
+
+/// Checks the temporary explicit-principal opt-in for request authorization.
+/// Bare headers stay on the deployment path, even when conditions mention principal.
+///
+/// # Errors
+/// Rejects invalid source or a stored policy mixing bare and constrained headers.
+pub fn request_authorization_eligible(source: &CedarPolicySource) -> Result<bool, CedarError> {
+    let (policies, _, _) = validation::parse_and_validate(source)?;
+    let mut bare = false;
+    let mut explicit = false;
+    for policy in policies.policies() {
+        if matches!(
+            policy.principal_constraint(),
+            cedar_policy::PrincipalConstraint::Any
+        ) {
+            bare = true;
+        } else {
+            explicit = true;
+        }
+    }
+    if bare && explicit {
+        return Err(CedarError::Unsupported {
+            policy_id: "policy-set".into(),
+            reason: "mixed bare and constrained principal headers; request authorization requires \
+                     explicit principal headers on every permit and forbid",
+        });
+    }
+    Ok(explicit)
 }
 
 /// Produces official PST for translation after the same checks as [`validate`].
@@ -36,8 +66,22 @@ pub fn validate(source: &CedarPolicySource) -> Result<Vec<ValidationWarning>, Ce
 /// # Errors
 /// Returns the same admission errors as [`validate`], or an SDK PST conversion error.
 pub fn pst(source: &CedarPolicySource) -> Result<cedar_policy::pst::PolicySet, CedarError> {
-    let (policies, _) = validation::parse_and_validate(source)?;
+    let (policies, _, _) = validation::parse_and_validate(source)?;
     Ok(policies.try_into_pst().map_err(Box::new)?)
+}
+
+/// Lowers credential-annotated HTTP rules in canonical rule-ID order without file I/O.
+///
+/// Non-credential Cedar returns an empty vector. Admission rejects an entire
+/// credential set if any statement cannot be consumed exactly by the HTTP model.
+///
+/// # Errors
+/// Returns the admission errors of [`validate`], including unsupported HTTP constructs.
+pub fn credential_rules(
+    source: &CedarPolicySource,
+) -> Result<Vec<http::CredentialRule>, CedarError> {
+    let (_, _, rules) = validation::parse_and_validate(source)?;
+    Ok(rules)
 }
 
 /// Failures before a Cedar source can become a validated policy representation.

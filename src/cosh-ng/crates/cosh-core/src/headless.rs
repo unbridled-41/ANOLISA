@@ -679,6 +679,32 @@ where
                     );
                     return InputLineResult::Continue;
                 }
+                if model != crate::auth::trial_policy::MODEL
+                    && crate::auth::trial_policy::decide(
+                        &engine.config,
+                        &crate::auth::trial_policy::ProviderIntent::from_env(),
+                        true,
+                        true,
+                        true,
+                    ) == crate::auth::trial_policy::TrialDecision::EcsIdentity
+                    && (engine.trial_identity_provider.is_some()
+                        || engine
+                            .config
+                            .ai
+                            .providers
+                            .values()
+                            .any(crate::config::ProviderConfig::is_ecs_identity))
+                {
+                    engine.emit(
+                        writer,
+                        &OutputMessage::result_error_with_code(
+                            &engine.session_id,
+                            "ECS automatic access uses the fixed model auto; use /auth to configure another provider",
+                            Some("EcsTrialModelFixed"),
+                        ),
+                    );
+                    return InputLineResult::Continue;
+                }
                 engine.config.ai.active_model = Some(model.clone());
                 engine.model = model.clone();
                 engine.emit(
@@ -791,6 +817,8 @@ where
                     }
                     let message = if preference_error {
                         "automatic access preferences are unavailable; automatic model access is disabled; use /auth"
+                    } else if code == "EcsTrialDisabled" {
+                        "automatic model access is disabled; use /auth to enable automatic access or configure a model"
                     } else {
                         "no model configured; use /auth to configure or re-enable a model"
                     };
@@ -931,19 +959,12 @@ where
                 );
                 return InputLineResult::Continue;
             };
-            let mut restored_config = if domain == "auth"
-                && matches!(action.as_str(), "state" | "activate" | "activate_trial")
-            {
-                trial::restored_model_config(engine)
-            } else {
-                None
-            };
             let mut response = crate::registry::handle_registry_request(
                 &request_id,
                 &domain,
                 &action,
                 &params,
-                restored_config.as_mut().unwrap_or(&mut engine.config),
+                &mut engine.config,
                 manager,
                 None,
                 Some(extensions.live),
@@ -956,9 +977,6 @@ where
                     OutputMessage::RegistryResponse { success: true, .. }
                 )
             {
-                if let Some(config) = restored_config {
-                    engine.config = config;
-                }
                 let resolved = engine.config.resolve_provider();
                 engine.provider = crate::create_provider(&engine.config);
                 engine.model = resolved.model;

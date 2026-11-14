@@ -102,14 +102,7 @@ impl OptLlmConfig {
         }
         let json = serde_json::to_string_pretty(&on_disk)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, json)?;
-        // Defense in depth: keep the sealed config owner-only as well.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::config::atomic_write::write_private_config_atomically(path, &json)
     }
 
     fn effective_base_url(&self) -> String {
@@ -417,6 +410,10 @@ fn step_dimension(step: &agentsight_atif::Step) -> Option<&str> {
         .as_str()
 }
 
+#[cfg(test)]
+#[path = "optimize_cache_usage_tests.rs"]
+mod cache_usage_tests;
+
 /// Create or update the per-target optimization run root trajectory
 /// (`opt:<target>`). Each dimension analysis contributes exactly one dispatch
 /// step with a `ToolCall(Agent)` + `subagent_trajectory_ref` pointing at the
@@ -515,7 +512,10 @@ fn upsert_opt_run_root(
         metrics: Some(schema::Metrics {
             prompt_tokens: Some(dim_prompt),
             completion_tokens: Some(dim_completion),
-            cached_tokens: None,
+            cached_tokens: dim_doc
+                .final_metrics
+                .as_ref()
+                .and_then(|m| m.total_cached_tokens),
             cost_usd: None,
             logprobs: None,
             completion_token_ids: None,
@@ -556,10 +556,15 @@ fn upsert_opt_run_root(
                     completion + metrics.and_then(|m| m.completion_tokens).unwrap_or(0),
                 )
             });
+    let total_cached = root
+        .steps
+        .iter()
+        .filter_map(|step| step.metrics.as_ref().and_then(|m| m.cached_tokens))
+        .reduce(|total, cached| total + cached);
     root.final_metrics = Some(schema::FinalMetrics {
         total_prompt_tokens: Some(total_prompt),
         total_completion_tokens: Some(total_completion),
-        total_cached_tokens: None,
+        total_cached_tokens: total_cached,
         total_cost_usd: None,
         total_steps: Some(root.steps.len()),
         extra: None,
@@ -2431,3 +2436,7 @@ mod tests {
         assert!(!serialized.contains("search_timeout_secs"), "{serialized}");
     }
 }
+
+#[cfg(test)]
+#[path = "../config/optimization_save_tests.rs"]
+mod atomic_save_tests;

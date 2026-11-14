@@ -60,6 +60,7 @@ fn equals_syntax_option_looking_values_and_awkward_paths_are_preserved() {
         "policy".into(),
         "create".into(),
         "--name=--help".into(),
+        "--language=json".into(),
         "--file".into(),
         file.into_os_string(),
         "--socket=/run/asc.sock".into(),
@@ -244,21 +245,12 @@ fn repeated_socket_options_reject_non_utf8_inline_paths_at_every_level() {
 fn file_errors_duplicate_keys_and_oversized_inputs_are_local_failures() {
     let directory = common::Directory::new();
     let path = directory.0.join("template.json");
-    let args = [
-        "agent-sec-cli",
-        "--socket",
-        "/run/absent.sock",
-        "policy",
-        "create",
-        "--name",
-        "test",
-        "--file",
-        path.to_str().unwrap(),
-    ];
-    assert!(matches!(
-        Cli::parse_from(args).unwrap().request(),
-        Err(InputError::Read(_))
-    ));
+    for operation in ["create", "update"] {
+        assert!(matches!(
+            policy_file_cli(operation, &path, &["--language", "json"]).request(),
+            Err(InputError::Read(_))
+        ));
+    }
     for bytes in [
         b"not-json".as_slice(),
         br#"{"specVersion":"0.1","rules":[],"rules":[]}"#,
@@ -269,16 +261,20 @@ fn file_errors_duplicate_keys_and_oversized_inputs_are_local_failures() {
         br#"{"language":"cedar","content":{"schema":{"schemaId":"seccore.system","revision":1,"revision":2},"text":"first"}}"#,
     ] {
         std::fs::write(&path, bytes).unwrap();
-        assert!(matches!(
-            Cli::parse_from(args).unwrap().request(),
-            Err(InputError::Json(_))
-        ));
+        for operation in ["create", "update"] {
+            assert!(matches!(
+                policy_file_cli(operation, &path, &["--language", "json"]).request(),
+                Err(InputError::Json(_))
+            ));
+        }
     }
     std::fs::write(&path, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
-    assert!(matches!(
-        Cli::parse_from(args).unwrap().request(),
-        Err(InputError::TooLarge)
-    ));
+    for operation in ["create", "update"] {
+        assert!(matches!(
+            policy_file_cli(operation, &path, &["--language", "json"]).request(),
+            Err(InputError::TooLarge)
+        ));
+    }
 }
 
 #[test]
@@ -303,6 +299,8 @@ fn policy_file_errors_retain_original_line_and_column() {
                 command,
                 "--name",
                 "test",
+                "--language",
+                "json",
                 "--file",
                 path.to_str().unwrap(),
             ];
@@ -628,7 +626,7 @@ fn scope_create_excludes_unsupported_cgroup_selector() {
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
         let help = String::from_utf8(output.stdout).unwrap();
-        for selector in ["--pid", "--process-name", "--executable"] {
+        for selector in ["--pid", "--process-name", "--executable", "--cmdline-arg"] {
             assert!(help.contains(selector), "{help}");
         }
         assert!(!help.contains("--cgroup-id"), "{help}");
@@ -665,7 +663,11 @@ fn scope_owner_uid_maps_to_rpc_and_rejects_root_or_pid_credential_selection() {
         "--policy-revision",
         "1",
     ];
-    for (flag, value) in [("--process-name", "agent"), ("--executable", "/bin/agent")] {
+    for (flag, value) in [
+        ("--process-name", "agent"),
+        ("--executable", "/bin/agent"),
+        ("--cmdline-arg", "/usr/local/bin/agent"),
+    ] {
         let args = base.into_iter().chain([flag, value, "--owner-uid", "1000"]);
         let request = Cli::parse_from(args).unwrap().request().unwrap();
         assert_eq!(request.params["ownerUid"], 1000);
@@ -683,15 +685,23 @@ fn scope_owner_uid_maps_to_rpc_and_rejects_root_or_pid_credential_selection() {
 
 #[test]
 fn scope_create_encodes_name_and_path_assignments() {
-    for (flag, matcher) in [
-        ("--process-name", json!({"processName":"scope-agent"})),
-        ("--executable", json!({"executable":"/opt/agent"})),
+    for (flag, value, matcher) in [
+        (
+            "--process-name",
+            "scope-agent",
+            json!({"processName":"scope-agent"}),
+        ),
+        (
+            "--executable",
+            "/opt/agent",
+            json!({"executable":"/opt/agent"}),
+        ),
+        (
+            "--cmdline-arg",
+            "/usr/local/bin/agent",
+            json!({"cmdlineArg":"/usr/local/bin/agent"}),
+        ),
     ] {
-        let value = if flag == "--process-name" {
-            "scope-agent"
-        } else {
-            "/opt/agent"
-        };
         let request = Cli::parse_from([
             "agent-sec-cli",
             "scope",
@@ -724,30 +734,31 @@ fn scope_create_encodes_name_and_path_assignments() {
         ])
         .is_err()
     );
+    assert!(
+        Cli::parse_from([
+            "agent-sec-cli",
+            "scope",
+            "create",
+            "--executable",
+            "/usr/bin/node",
+            "--cmdline-arg",
+            "/usr/local/bin/agent"
+        ])
+        .is_err()
+    );
 }
 
 #[test]
-fn gateway_transport_and_invalid_secret_paths_fail_without_reading_credentials() {
-    use std::os::unix::ffi::OsStringExt as _;
-
+fn gateway_transport_failure_never_falls_back_to_local_execution() {
     let directory = common::Directory::new();
     let socket = directory.0.join("absent.sock");
-    for arguments in [
-        vec![OsString::from("status")],
-        vec![
-            "key".into(),
-            "add".into(),
-            "github".into(),
-            "--secret-file".into(),
-            OsString::from_vec(b"/unread-secret-\xff".to_vec()),
-        ],
-    ] {
-        let mut args = vec![
+    for command in ["status", "ca"] {
+        let args = vec![
             OsString::from("--socket"),
             socket.as_os_str().into(),
             "gateway".into(),
+            command.into(),
         ];
-        args.extend(arguments);
         let cli =
             Cli::parse_from(std::iter::once(OsString::from("agent-sec-cli")).chain(args.clone()))
                 .unwrap();
@@ -757,13 +768,7 @@ fn gateway_transport_and_invalid_secret_paths_fail_without_reading_credentials()
         assert!(output.stdout.is_empty());
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(error.starts_with("agent-sec-cli: "), "{error}");
-        let expected = if args.last().unwrap() == "status" {
-            "connection unavailable"
-        } else {
-            "--secret-file must be UTF-8"
-        };
-        assert!(error.contains(expected), "{error}");
-        assert!(!error.contains("unread-secret"), "{error}");
+        assert!(error.contains("connection unavailable"), "{error}");
     }
     assert!(!socket.exists());
 }
@@ -782,7 +787,6 @@ async fn gateway_cli_preserves_minimal_results_and_conflicts() {
     }
     let directory = common::Directory::new();
     let socket = directory.0.join("gateway.sock");
-    let relative_secret = std::path::absolute("gateway token").unwrap();
     let cases: &[(&[&str], &str, Value, Value)] = &[
         (&["enable"], "gateway.enable", json!({}), json!({})),
         (&["disable"], "gateway.disable", json!({}), json!({})),
@@ -796,36 +800,24 @@ async fn gateway_cli_preserves_minimal_results_and_conflicts() {
             &["key", "list"],
             "gateway.key.list",
             json!({}),
-            json!({"credentials":["github"]}),
+            json!({"pairids":["pair-1"]}),
         ),
         (
-            &["key", "add", "github", "--secret-file", "/root/a b"],
-            "gateway.key.add",
-            json!({"credential":"github","secretFile":"/root/a b"}),
-            json!({"credential":"github"}),
-        ),
-        (
-            &["key", "add", "github", "--secret-file", "gateway token"],
-            "gateway.key.add",
-            json!({"credential":"github","secretFile":relative_secret}),
-            json!({"credential":"github"}),
-        ),
-        (
-            &["key", "remove", "github"],
+            &["key", "remove", "pair-1"],
             "gateway.key.remove",
-            json!({"credential":"github"}),
-            json!({"credential":"github"}),
+            json!({"pairid":"pair-1"}),
+            json!({"pairid":"pair-1"}),
         ),
         (
-            &["credentials", "--scope", "scope-1"],
-            "gateway.credentials",
-            json!({"scopeId":"scope-1"}),
-            json!({"scopeId":"scope-1","environment":{"GITHUB_TOKEN":"fake","GIT_SSL_CAINFO":"/run/agent-sec-gateway/ca-bundle.pem"}}),
+            &["ca"],
+            "gateway.ca",
+            json!({}),
+            json!({"caBundlePath":"/run/agent-sec-gateway/ca-bundle.pem"}),
         ),
         (
-            &["key", "add", "github", "--secret-file", "/root/new"],
-            "gateway.key.add",
-            json!({"credential":"github","secretFile":"/root/new"}),
+            &["key", "remove", "pair-1"],
+            "gateway.key.remove",
+            json!({"pairid":"pair-1"}),
             Value::Null,
         ),
     ];
@@ -842,7 +834,7 @@ async fn gateway_cli_preserves_minimal_results_and_conflicts() {
             DaemonResponse::error(
                 RequestId::new("gateway-test").unwrap(),
                 "conflict",
-                "credential already holds a different value",
+                "credential pair retirement has a publication conflict",
             )
         } else {
             DaemonResponse::success(RequestId::new("gateway-test").unwrap(), result.clone())
@@ -887,47 +879,196 @@ fn assert_gateway_output(output: &std::process::Output, result: &Value, response
     }
 }
 
+fn policy_file_cli(operation: &str, file: &std::path::Path, options: &[&str]) -> Cli {
+    let mut params = json!({"policyName":"sandbox"});
+    if operation == "update" {
+        params["policyId"] = json!("sandbox-baseline");
+    }
+    let row = json!({"method":format!("policy.templates.{operation}"), "params":params});
+    let mut args = vec![OsString::from("agent-sec-cli")];
+    args.extend(common::args_for(
+        &row,
+        file.parent().unwrap(),
+        &file.parent().unwrap().join("absent.sock"),
+    ));
+    args.extend([OsString::from("--file"), file.as_os_str().into()]);
+    args.extend(options.iter().map(OsString::from));
+    Cli::parse_from(args).unwrap()
+}
+
 #[test]
-fn policy_commands_accept_tagged_cedar_source_files() {
+fn policy_commands_accept_raw_and_tagged_cedar_sources() {
     let directory = common::Directory::new();
     let file = directory.0.join("cedar-policy.json");
-    let source = json!({"language":"cedar", "content":{
-        "schema":{"schemaId":"seccore.system", "revision":1},
-        "text":"permit(principal, action, resource);"
-    }});
-    std::fs::write(&file, serde_json::to_vec(&source).unwrap()).unwrap();
-    for operation in ["create", "update"] {
-        let mut args = vec![
-            "agent-sec-cli",
-            "policy",
-            operation,
-            "--name",
-            "sandbox",
-            "--file",
-            file.to_str().unwrap(),
-        ];
-        if operation == "update" {
-            args.extend(["--policy-id", "sandbox-baseline"]);
+    let raw = directory.0.join("policy.cedar");
+    for (schema_id, revision) in [
+        ("seccore.system", 1),
+        ("seccore.system", 2),
+        ("custom.schema", 2),
+    ] {
+        let source = json!({"language":"cedar", "content":{
+            "schema":{"schemaId":schema_id, "revision":revision},
+            "text":"// Preserve this comment.\r\npermit(principal, action, resource);\n"
+        }});
+        std::fs::write(&file, serde_json::to_vec(&source).unwrap()).unwrap();
+        std::fs::write(&raw, source["content"]["text"].as_str().unwrap()).unwrap();
+        let revision = revision.to_string();
+        for operation in ["create", "update"] {
+            let request = policy_file_cli(operation, &file, &["--language", "json"])
+                .request()
+                .unwrap();
+            let mut params = json!({"policyName":"sandbox", "template":source});
+            if operation == "update" {
+                params["policyId"] = json!("sandbox-baseline");
+            }
+            assert_eq!(request.params, params);
+            assert_eq!(request.method, format!("policy.templates.{operation}"));
+            let raw_request = policy_file_cli(
+                operation,
+                &raw,
+                &[
+                    "--language",
+                    "cedar",
+                    "--schema-id",
+                    schema_id,
+                    "--schema-revision",
+                    &revision,
+                ],
+            )
+            .request()
+            .unwrap();
+            assert_eq!(
+                raw_request, request,
+                "{operation} raw/envelope equivalent wire"
+            );
         }
-        let request = Cli::parse_from(args).unwrap().request().unwrap();
-        assert_eq!(request.params["template"], source);
-        assert_eq!(request.method, format!("policy.templates.{operation}"));
+        let mut with_trailing_data = serde_json::to_vec(&source).unwrap();
+        with_trailing_data.extend_from_slice(b" {}");
+        std::fs::write(&file, with_trailing_data).unwrap();
+        for operation in ["create", "update"] {
+            assert!(matches!(
+                policy_file_cli(operation, &file, &["--language", "json"]).request(),
+                Err(InputError::Json(_))
+            ));
+        }
     }
-    let mut with_trailing_data = serde_json::to_vec(&source).unwrap();
-    with_trailing_data.extend_from_slice(b" {}");
-    std::fs::write(&file, with_trailing_data).unwrap();
-    assert!(
-        Cli::parse_from([
-            "agent-sec-cli",
-            "policy",
-            "create",
-            "--name",
-            "sandbox",
-            "--file",
-            file.to_str().unwrap()
-        ])
-        .unwrap()
-        .request()
-        .is_err()
-    );
+}
+
+#[test]
+fn raw_cedar_create_and_update_preserve_text_and_schema_selection() {
+    let directory = common::Directory::new();
+    let file = directory.0.join("policy=a b.cedar");
+    let text = "  // Preserve café and line endings.\r\npermit(principal, action, resource);\r\n\t";
+    std::fs::write(&file, text).unwrap();
+    let cases: &[(&[&str], &str, u32)] = &[
+        (&["--language", "cedar"], "seccore.system", 1),
+        (
+            &["--language", "cedar", "--schema-revision", "2"],
+            "seccore.system",
+            2,
+        ),
+        (
+            &["--language", "cedar", "--schema-id", "custom.schema"],
+            "custom.schema",
+            1,
+        ),
+        (
+            &[
+                "--language",
+                "cedar",
+                "--schema-id",
+                "custom.schema",
+                "--schema-revision",
+                "2",
+            ],
+            "custom.schema",
+            2,
+        ),
+    ];
+    for (options, schema_id, revision) in cases {
+        for operation in ["create", "update"] {
+            let request = policy_file_cli(operation, &file, options)
+                .request()
+                .unwrap();
+            let mut params = json!({"policyName":"sandbox", "template":{
+                "language":"cedar", "content":{
+                    "schema":{"schemaId":schema_id, "revision":revision}, "text":text
+                }
+            }});
+            if operation == "update" {
+                params["policyId"] = json!("sandbox-baseline");
+            }
+            assert_eq!(request.params, params, "{operation} {options:?}");
+            assert_eq!(request.method, format!("policy.templates.{operation}"));
+        }
+    }
+}
+
+#[test]
+fn raw_cedar_invalid_utf8_and_oversized_files_fail_locally() {
+    let directory = common::Directory::new();
+    let file = directory.0.join("policy.cedar");
+    std::fs::write(
+        &file,
+        b"// invalid byte: \xff\npermit(principal, action, resource);",
+    )
+    .unwrap();
+    for operation in ["create", "update"] {
+        assert!(matches!(
+            policy_file_cli(operation, &file, &["--language", "cedar"]).request(),
+            Err(InputError::PolicyUtf8)
+        ));
+    }
+    std::fs::write(&file, vec![b' '; asc_daemon_client::MAX_FRAME_BYTES + 1]).unwrap();
+    for operation in ["create", "update"] {
+        assert!(matches!(
+            policy_file_cli(operation, &file, &["--language", "cedar"]).request(),
+            Err(InputError::TooLarge)
+        ));
+    }
+}
+
+#[test]
+fn json_policy_files_reject_raw_schema_options() {
+    let directory = common::Directory::new();
+    let file = directory.0.join("policy.json");
+    let options: &[&[&str]] = &[
+        &["--language", "json", "--schema-id", "seccore.system"],
+        &["--language", "json", "--schema-revision", "2"],
+        &[
+            "--language",
+            "json",
+            "--schema-id",
+            "custom.schema",
+            "--schema-revision",
+            "2",
+        ],
+    ];
+    for source in [
+        json!({"specVersion":"0.1", "rules":[]}),
+        json!({"language":"cedar", "content":{
+            "schema":{"schemaId":"seccore.system", "revision":1},
+            "text":"permit(principal, action, resource);"
+        }}),
+    ] {
+        std::fs::write(&file, serde_json::to_vec(&source).unwrap()).unwrap();
+        for operation in ["create", "update"] {
+            assert_eq!(
+                policy_file_cli(operation, &file, &["--language", "json"])
+                    .request()
+                    .unwrap()
+                    .params["template"],
+                source
+            );
+            for options in options {
+                assert!(
+                    matches!(
+                        policy_file_cli(operation, &file, options).request(),
+                        Err(InputError::SchemaWithJson)
+                    ),
+                    "{operation} {options:?}"
+                );
+            }
+        }
+    }
 }

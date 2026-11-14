@@ -15,11 +15,19 @@
 AgentSecCore 的相关安全控制已纳入 [ANOLISA OWASP Agentic Top 10 控制映射](../../docs/user-guide/zh/agent-sec-core/owasp-agentic-top10.md)。
 
 Rust V2 支持 `agent-sec-cli sandbox run --permissions permissions.json -- command`，
-按明确的文件和网络权限在本地执行，无需 daemon。权限格式、运行要求与隔离边界见
+按明确的文件和网络权限在本地执行，无需 daemon。`--permissions` 接受原有 OS permission JSON
+或 Cedar 源码；Cedar 会转换为进程树共用的粗粒度权限。`PermissionInput` 和 Cosh sandbox Hook
+使用相同输入生成每次 PDP 权限申请。权限格式、运行要求与隔离边界见
 [Sandbox 指南](../../docs/user-guide/zh/agent-sec-core/sandbox.md)。应用可通过
-`asc-pep-runtime::PepRuntime` 接入策略授权，由 daemon `--authorization-config`
-选择 PAP 管理的 Cedar 策略。Policy 更新成功后，后续授权请求使用新版本。
-Cosh 可通过 `AGENT_SEC_COSH_SANDBOX_PERMISSIONS` 接入这条流程，并复用原生审批界面。
+`asc-pep-runtime::PepRuntime` 接入策略授权，daemon 默认启用授权并读取 PAP 管理的
+Cedar 策略；适用策略集为空时拒绝请求。Policy 更新成功后，后续授权请求使用新版本。
+Cosh 通过 `AGENT_SEC_COSH_SANDBOX_ALL_SHELL=1` 接入这条流程，使用原生审批界面和
+已安装的默认权限模板。所有已接入的 `shell` / `run_shell_command` 调用，包括普通
+Python 脚本和含 `sudo` 的原始命令，均经过授权。开关默认关闭；配置、权限边界和失败
+处理见 Sandbox 指南。
+设置 `AGENT_SEC_COSH_SANDBOX_PERMISSION_SOURCE=command` 并提供明确的 Cedar
+`AGENT_SEC_COSH_SANDBOX_RUNTIME_PERMISSIONS` 预设，可按每次原始命令和 cwd 生成权限
+申请。候选不更新 PAP；澄清、生成失败和转换失败均阻断执行。
 
 ## 背景
 
@@ -85,32 +93,16 @@ daemon 自己拥有的叶目录权限会先修复为 `0700`。
 两处都有数据库，或选址会绕过已有数据库时拒绝启动；显式 `AGENT_SEC_DATA_DIR` 仍为固定路径。
 详见 [Policy 存储](../../docs/user-guide/zh/agent-sec-core/policy-cli.md#policy-数据库位置)。
 PolicyTemplate 是包含通用规则的可复用策略；PEP Translator 对原生 JSON 支持文件删除 block 规则。
-现有 Policy create/update 命令也接受携带精确 schema 引用的 Cedar 源码封装，完成准入校验和源码保存；
-Cedar `forbid` 删除/普通写入限制已接入翻译与部署。原生 JSON 请求及保存快照保持原有格式。
+Policy create/update 命令缺省直接读取 Cedar 原文，并携带精确 schema 引用完成准入校验和源码保存；
+`--language json` 保留原生 JSON 模板和 Cedar 源码封装；
+Cedar `forbid` 删除/普通写入限制已接入翻译与部署。原生 JSON 文件策略请求及保存快照保持
+原有格式。
 Scope 保存不可变策略快照，拥有自动 Binding 创建、下发和清理生命周期。
 可通过 daemon 的 `--policy-admin-uid <UID>` 授权非 root Policy CLI 调用者；默认仍只授权 root。
 
 **兼容性变更（Breaking change）**：移除 `scope create --cgroup-id`，此前不支持 cgroup
-assignment。请更新脚本，使用 `--pid`、`--process-name` 或 `--executable` 选择目标进程。
-
-V2 **Secret Gateway 预览能力**让真实 GitHub 凭据不进入 Agent 进程。
-V2 `agent-sec-core` RPM 自动启动基础 daemon，但网关默认关闭；root 显式安装 mitmproxy。
-raw 包包含相同网关资产，但不启动两个服务；网关启停仅由 daemon 管理，卸载时撤流失败则拒绝删除。
-`gateway key add github --secret-file /root/github.token` 只导入，不授权；相同 secret 幂等成功，
-不同值报错且不覆盖。更换必须先 remove 再 add、创建新 Scope 并更新 Agent 配置，旧 fake
-永久退役，不自动轮换。既有原生 Policy JSON 通过 `network/use_credential` 授权 HTTPS 请求；Scope 固定 Policy revision
-快照，并指定非 root owner 和进程 selector。先准备 Scope、启用网关，再以 owner 查询
-`gateway credentials --scope <scopeId>`，将 fake 与 CA 配入 Agent 后启动。
-discovery 自动接管匹配实例，不保证 first packet 保护。实例重启保持 Scope fake；删除 Scope
-只撤销其 fake，`gateway key remove github` 则全局退役凭据。只读 status 与凭据查询按 UID
-隔离：status 返回 `{enabled, ready, scopes}`，Scope 项为 `{scopeId, bindings}`，credentials
-返回 `{scopeId, environment}`。`ready` 要求已启用、cgroup v2 只读检查通过、代理 unit active、
-已加载 generation 匹配且 CA 可用。enable 在改变 enabled 前检查 cgroup v2；发布（含已启用
-状态恢复）、已启用时的 status 查询与凭据查询重新检查。默认关闭恢复跳过此预检；不降级为
-cgroup v1、不改挂载。nftables `socket cgroupv2` 仅在实际规则应用时检验，不做独立预检；
-实例 Binding `READY` 仍需另行等待。key list 只列 active IDs（`{"credentials":["github"]}`），add/remove 返回
-`{"credential":"github"}`，enable/disable 成功返回 `{}`。
-参阅 [Secret Gateway 设计](docs/design/V2_SECRET_GATEWAY_DESIGN_zh.md)。
+assignment。请更新脚本，使用 `--pid`、`--process-name`、`--executable` 或 `--cmdline-arg`
+选择目标进程；最后一种 selector 通过完整命令行参数识别由解释器承载的进程。
 
 V2 原生 OTel 目前仅用于本地日志关联，不提供公开 OTLP exporter。
 现有 `--trace-context` JSON 传入 Agent 归属；`--otel-context`（version 1）传入上游
@@ -126,6 +118,23 @@ Rust 解析并校验，不改写其语义。纯禁止不补允许，无法表达
 CLI 与 daemon 须同步升级为 request v1/candidate v1，其它版本不兼容。
 候选不会批准、安装或执行策略。详见
 [Intent 命令参考](../../docs/user-guide/zh/agent-sec-core/policy-cli.md#intent从任务生成待审候选)。
+
+源码中的 V2 API `intent.propose_command` 面向 hook 集成，接收 `command` 和 `cwd`，
+返回 Cedar 候选或澄清原因；CLI 通过 `agent-sec-cli intent propose-command` 暴露该接口。
+两者都不更新 base policy、不映射 OS 权限，也不执行命令；
+可选的 Cosh 动态 Hook 将候选与明确的运行预设合并，沿用已有 PDP/sandbox 生命周期。详见
+[单次命令 Cedar API](docs/design/DAEMON_PROTOCOL_V1_zh.md#191-target-v2已实现-单次命令-cedar-api)。
+
+`agent-sec-cli intent init` 从显式规则在本地生成经过校验的 Cedar，
+无需 daemon、模型或网络：
+
+```bash
+agent-sec-cli intent init --deny-network
+agent-sec-cli intent init --allow-read '/data/**' --allow-write '/data/out/**' --deny-network
+```
+
+输出是未批准的预览：forbid 优先于 permit，未被 permit 列出的一切默认拒绝。详见
+[Intent init 命令参考](../../docs/user-guide/zh/agent-sec-core/policy-cli.md#intent-init从显式规则本地生成-cedar)。
 
 ## 安全防护架构
 
@@ -414,7 +423,7 @@ agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 
 V2 在 daemon 启动时加载 `/etc/agent-sec/pii-checker/rules.yaml`，也可通过
 `agent-sec-daemon --pii-rules /absolute/path/rules.yaml` 指定其他文件；重启后更新。
-V1 保留 `~/.config/agent-sec/pii-checker/rules.yaml`。V2 报告 coverage、规则标识及 `summary.scanner_version: "2.1.1"`；
+V1 保留 `~/.config/agent-sec/pii-checker/rules.yaml`。V2 报告 coverage、规则标识及 `summary.scanner_version: "2.1.2"`；
 覆盖不完整时的 `pass` 不代表检测完整。本阶段保持 Hook 契约，不切换真实宿主，也不新增 PDP 执行控制。
 公共 CLI `--trace-context` 适配通过顶层 OTel 信封传播关联信息，不支持 `params.traceContext`。
 

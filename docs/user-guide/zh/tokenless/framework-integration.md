@@ -35,8 +35,9 @@ QwenPaw 和 AgentScope SDK 集成提供静态恢复工具及当前模型调用�
 HTML 和 Diff 裁剪。内容来源、可恢复性和收益门禁仍然生效，不代表每个结果
 都会被压缩。QwenPaw 与 AgentScope 在构造 SDK 配置时继承
 `TOKENLESS_COMPRESSION_ENABLED`、`TOKENLESS_SEARCH_PATH_SHARING_ENABLED`、
-`TOKENLESS_HTML_EXTRACTION_ENABLED` 和 `TOKENLESS_DIFF_COMPRESSION_ENABLED`。
-显式 SDK 参数优先于环境默认值。Diff 默认开启；压缩总开关控制 dry-run，不会关闭 RTK 改写。
+`TOKENLESS_HTML_EXTRACTION_ENABLED`、`TOKENLESS_DIFF_COMPRESSION_ENABLED` 和
+`TOKENLESS_MIXED_CONTENT_ENABLED`。显式 SDK 参数优先于环境默认值。Diff 默认开启，
+混合区域压缩默认关闭；压缩总开关控制 dry-run，不会关闭 RTK 改写。
 
 | 宿主或集成 | 剩余边界 |
 |------------|----------|
@@ -77,6 +78,7 @@ macOS 私有恢复桥接。没有恢复路径时，Core 只接受无损候选。
 | 宿主支持文本替换时，来自命令输出的 Git Diff（默认开启，`TOKENLESS_DIFF_COMPRESSION_ENABLED=0` 关闭） | 按 Hunk 选择裁剪未变更上下文；保留全部变更行，完整原文经 Stash 可取回，收益过小的候选会被拒绝 |
 | 宿主支持文本替换且 Stash 恢复可用时，来自命令输出或 API 响应（不含文件读取）的完整 HTML 文档；默认开启，`TOKENLESS_HTML_EXTRACTION_ENABLED=0` 关闭 | 主内容转写为 Markdown，视图头部写明移除计数；完整原文经 Stash 可取回，收益过小的候选会被拒绝 |
 | Stash 恢复可用时，来自命令输出或 API 响应（不含文件读取）的 JSON 字符串值中的 HTML 片段或文档；与 HTML 页面共用开关 | 每个值就地完整转写为 Markdown，类型、数字和其他字段不变；视图可能丢失可见文字、目标地址、表单状态以及样式、属性、换行、列表编号或表头所承载含义，或暴露屏幕上被隐藏文字的值原样保留，每个原始值经 Stash 可取回。详见 [JSON 值中的 HTML](configuration-and-privacy.md#json-值中的-html) |
+| `TOKENLESS_MIXED_CONTENT_ENABLED` 显式开启（默认关闭）且宿主支持文本替换时，任何整内容领域都无法处理的混合工具输出 | fenced `json`/`csv`/`tsv` 块与括号平衡的裸 JSON 文档按区域用与独立路由相同的策略压缩；周围文本逐字节保留，被拒绝的区域逐字节保留 |
 | 长纯文本、Stack Trace、源码、Unknown | 对应领域 Compressor 接入前原样透传 |
 
 内容检测、PostTool 200 字符门禁、基于工具来源的阈值、诊断、TOON 选择和最终接受均属于
@@ -84,9 +86,11 @@ Core 策略。Hook 只把宿主对象映射为 v2 字段；它可以跳过明显
 无意义地启动子进程。
 
 原生 Shell 包装中的主要 `stdout` 或 `stderr` 字段从 200 字符起进入文本路由，让短日志
-与纯文本使用相同的领域压缩器；Qoder 原生 Bash 始终选择 `stdout`，包括较短或为空的值。
-其他字段保持不变。Qoder 原生 Bash 的 stdout、Claude Code
-和千问办公继续返回对象。Cosh-NG 解包 `llmContent` 内的 Shell JSON 后，会把更新后的包装
+与纯文本使用相同的领域压缩器；Qoder 原生 Bash 只选择字符串 `stdout`，包括较短或为空的值。
+`stdout` 缺失或不是字符串时，不替换原始结果。`stderr` 和其他字段保持不变；错误诊断仍可
+读取 `stderr`。Qoder 原生 Bash 的 stdout 和 Claude Code 继续返回对象；千问办公将单流原生 Shell
+的 `stdout` 替换为文本字符串，对包含额外流、失败或未知字段的 Shell 包装保持透传（保留错误诊断），
+并为非 Shell 的结构化 MCP 结果保留对象和数组类型。Cosh-NG 解包 `llmContent` 内的 Shell JSON 后，会把更新后的包装
 序列化为其要求的字符串替换值；OpenCode 继续保留字符串输出契约。
 
 Common BeforeModel Hook 同样没有 Marker 授权恢复路径。当前 Schema 变换均为有损，因此 Core
@@ -161,7 +165,8 @@ PreToolUse 匹配 `Bash`、`mcp__workspace__bash`、
 使用 RTK 改写受支持的命令。PostToolUse **不设置工具 matcher**：
 符合条件的完整 Bash 及非 Bash 结果进入公共策略。`mcp_list`、`mcp_get`、`mcp_call`
 仅包含遥测信息的回调保持透传，避免用遥测替换真实内容；完整的 `mcp_call` 响应仍可正常压缩。
-被接受的结果通过 `updatedToolOutput` 替换原文；对象和数组保留类型，文本槽可以使用 TOON。
+被接受的结果通过 `updatedToolOutput` 替换原文：单流原生 Shell 的 `stdout` 与纯文本槽返回字符串
+（文本槽可使用 TOON，不把 Shell 包装序列化进输出），非 Shell 的结构化 MCP 对象和数组在最终交付文本同时减少字符数与估算 Token 数时保留类型。
 文件内容保护、不支持内容透传及 RTK 去重规则保持不变。统计使用独立 Agent ID `qwenwork`，
 不注册 Tool Ready 或 Schema Hook。
 
@@ -504,6 +509,19 @@ middleware 不返回替换内容也是如此。过大的 `details` 也可能被�
 `~/` 会展开为当前用户的主目录。未设置 `dbPath` 时，归档为 `OPENCLAW_STATE_DIR` 下的
 `selective-claw.db`；该环境变量未设置时使用 `~/.openclaw`。将插件的 `enabled` 选项设为
 `false` 时，不打开数据库，也不注册上下文引擎或召回工具。
+
+#### Selective-Claw 归档写入失败
+
+Selective-Claw 将每次首次导入或历史对齐批次的消息写入放在同一个 SQLite 保存点中。
+批次失败时回滚其中的写入并传递原始错误，因此空归档仍可执行首次导入。
+解决存储故障（例如容量耗尽）后，再重试失败的操作。旧代码已经留下的部分导入不会自动修复。
+
+若导入位于调用者已有的 SQLite 事务内，仍须由调用者提交。遇到 `SQLITE_FULL` 等错误时，
+SQLite 自身可能中止整个外层事务，调用者必须处理该失败；连接不可用时，清理也无法保证回滚。
+若保存点清理也失败，Plugin 会记录该二次错误，仍传递原始导入错误。仅凭这条警告无法判断
+SQLite 是否已经结束事务；若无法完成清理，须先重新打开 Plugin 的数据库连接再使用。
+该批次边界不覆盖后续摘要生成或上下文装配失败、其他生命周期调用，以及此前已提交的消息。
+无需迁移数据库结构。
 
 ### Hermes
 

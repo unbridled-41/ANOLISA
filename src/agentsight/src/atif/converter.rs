@@ -22,6 +22,13 @@ use crate::storage::sqlite::genai::TraceEventDetail;
 
 /// Build a plain text step (system prompt or user query) with no agent payload.
 fn text_step(step_id: usize, source: StepSource, timestamp_ns: i64, message: String) -> Step {
+    // Native export concatenates the request's full system instructions.
+    let extra = matches!(source, StepSource::System).then(|| {
+        HashMap::from([(
+            agentsight_atif::EXTRA_SYSTEM_PROMPT_SNAPSHOT.to_string(),
+            serde_json::Value::Bool(true),
+        )])
+    });
     Step {
         step_id,
         source,
@@ -33,7 +40,7 @@ fn text_step(step_id: usize, source: StepSource, timestamp_ns: i64, message: Str
         tool_calls: None,
         observation: None,
         metrics: None,
-        extra: None,
+        extra,
         llm_call_count: None,
         is_copied_context: None,
     }
@@ -122,7 +129,7 @@ pub fn convert_session_to_atif(
     // Group events into conversation turns, preserving order
     let trace_groups = group_by_conversation(&events, &parsed);
 
-    for (trace_events, trace_parsed) in &trace_groups {
+    for (group_idx, (trace_events, trace_parsed)) in trace_groups.iter().enumerate() {
         if trace_events.is_empty() {
             continue;
         }
@@ -168,6 +175,23 @@ pub fn convert_session_to_atif(
                     trace_events[i + 1],
                     trace_parsed.get(i + 1).and_then(|p| p.as_ref()),
                 ))
+            } else if trace_events[i].conversation_id.is_some()
+                && let Some((next_events, next_parsed)) = trace_groups.get(group_idx + 1)
+                && let Some(next_event) = next_events.first()
+                && next_event.conversation_id.is_some()
+                && next_event.start_timestamp_ns
+                    >= trace_events[i]
+                        .end_timestamp_ns
+                        .unwrap_or(trace_events[i].start_timestamp_ns)
+            {
+                // A tool result can be delivered by the first request of the
+                // next turn: a user interjection while the tool runs starts a
+                // new conversation, and that request replays the pending
+                // result. The result still belongs to the step that issued
+                // the call. Both turns need a resolved conversation id; an
+                // unknown turn must not be cross-correlated (it may be an
+                // unrelated replayed request).
+                Some((*next_event, next_parsed.first().and_then(|p| p.as_ref())))
             } else {
                 None
             };
@@ -537,9 +561,9 @@ fn build_agent_step(
         }
     }
 
-    // Observation: correlate tool_calls with responses from next event
+    // Provider results may be inline; client results arrive in the next request.
     let observation = if !tool_calls.is_empty() {
-        build_observation(&tool_calls, next)
+        build_observation(&tool_calls, event, parsed, next)
     } else {
         None
     };
@@ -646,13 +670,13 @@ fn messages_after_the_last_tool_call(messages: &[InputMessage]) -> &[InputMessag
     }
 }
 
-/// Build observation by looking for ToolCallResponse in the next event's input.
+/// Match inline provider results, then client results in the next request.
 fn build_observation(
     tool_calls: &[ToolCall],
+    event: &TraceEventDetail,
+    parsed: Option<&LLMCall>,
     next: Option<(&TraceEventDetail, Option<&LLMCall>)>,
 ) -> Option<Observation> {
-    let (next_event, next_parsed) = next?;
-
     let tc_ids: HashMap<&str, usize> = tool_calls
         .iter()
         .enumerate()
@@ -662,32 +686,53 @@ fn build_observation(
     let mut results: Vec<ObservationResult> = Vec::new();
     let mut matched_by_id = vec![false; tool_calls.len()];
 
-    // Strategy 1: from parsed LLMCall's full request messages (latest round only)
-    if let Some(call) = next_parsed {
-        let latest = latest_round_messages(&call.request.messages);
-        collect_tool_responses(latest, &tc_ids, &mut results, &mut matched_by_id);
-    } else {
-        // Strategy 2: from event_json parsed as LLMCall (latest round only)
-        if let Some(call) = parse_event_json(next_event) {
+    // Results in the response are authoritative; a replay must not replace
+    // them or consume an unmatched client call.
+    if let Some(call) = parsed {
+        collect_tool_response_parts(
+            call.response
+                .messages
+                .iter()
+                .map(|message| message.parts.as_slice()),
+            &tc_ids,
+            &mut results,
+            &mut matched_by_id,
+        );
+    } else if let Some(messages) = event
+        .output_messages
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<OutputMessage>>(json).ok())
+    {
+        collect_tool_response_parts(
+            messages.iter().map(|message| message.parts.as_slice()),
+            &tc_ids,
+            &mut results,
+            &mut matched_by_id,
+        );
+    }
+
+    if let Some((next_event, next_parsed)) = next {
+        let inline_count = results.len();
+        // Strategy 1: from parsed LLMCall's full request messages (latest round only)
+        if let Some(call) = next_parsed {
             let latest = latest_round_messages(&call.request.messages);
             collect_tool_responses(latest, &tc_ids, &mut results, &mut matched_by_id);
         }
-    }
 
-    // Strategy 3: from input_messages column. Narrowed to the round it
-    // carries: a completed row keeps only the current round there, but a row
-    // that never completed keeps the whole replayed history, and a multi-round
-    // turn keeps every round of the turn — an earlier round's id-less response
-    // would otherwise take this step's call through the positional fallback.
-    if results.is_empty() {
-        if let Some(ref json) = next_event.input_messages {
-            if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
-                let latest = messages_after_the_last_tool_call(&msgs);
-                collect_tool_responses(latest, &tc_ids, &mut results, &mut matched_by_id);
+        // Fall back to the input_messages column, narrowed to the round it
+        // carries: a completed row keeps only the current round there, but a row
+        // that never completed keeps the whole replayed history, and a multi-round
+        // turn keeps every round of the turn — an earlier round's id-less response
+        // would otherwise take this step's call through the positional fallback.
+        if results.len() == inline_count {
+            if let Some(ref json) = next_event.input_messages {
+                if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
+                    let latest = messages_after_the_last_tool_call(&msgs);
+                    collect_tool_responses(latest, &tc_ids, &mut results, &mut matched_by_id);
+                }
             }
         }
     }
-
     if results.is_empty() {
         None
     } else {
@@ -770,7 +815,7 @@ const ERROR_ENVELOPE_KEYS: &[&str] = &[
 /// `tool_call_response` sat on a `user` message and none on a `tool` message, so
 /// gating on role dropped all of them and left every observation empty. The part
 /// type is the reliable discriminator — `ToolCallResponse` is the only variant
-/// carrying a result, and assistant turns only ever carry `ToolCall`.
+/// carrying a result; provider-side results can also appear on assistant turns.
 ///
 /// Matching runs in two passes: every response that names a call through its id
 /// claims that call first, and only the responses the ids could not place are
@@ -784,6 +829,20 @@ fn collect_tool_responses(
     results: &mut Vec<ObservationResult>,
     matched: &mut [bool],
 ) {
+    collect_tool_response_parts(
+        messages.iter().map(|message| message.parts.as_slice()),
+        tc_ids,
+        results,
+        matched,
+    );
+}
+
+fn collect_tool_response_parts<'a>(
+    messages: impl IntoIterator<Item = &'a [MessagePart]>,
+    tc_ids: &HashMap<&str, usize>,
+    results: &mut Vec<ObservationResult>,
+    matched: &mut [bool],
+) {
     // Flatten the responses in message order once; both passes work over the
     // same list.
     let mut pending: Vec<(
@@ -791,8 +850,8 @@ fn collect_tool_responses(
         String,
         Option<HashMap<String, serde_json::Value>>,
     )> = Vec::new();
-    for msg in messages {
-        for part in &msg.parts {
+    for parts in messages {
+        for part in parts {
             if let MessagePart::ToolCallResponse { id, response } = part {
                 // Providers report tool failure out of band: Anthropic wraps a
                 // failed result as `{"content": …, "is_error": true}`, real
@@ -2722,6 +2781,61 @@ pub(crate) mod tests {
             .expect("calls of one conversation must stay in one group")
             .results;
         assert_eq!(results[0].source_call_id.as_deref(), Some("tc-9"));
+    }
+
+    /// A tool result can arrive after a user interjection starts a new
+    /// conversation: the next request carries the pending call's result plus
+    /// the interjection, so the resolver assigns it a different
+    /// `conversation_id`. The result still belongs to the step that issued the
+    /// call. The file-based converter merges exactly this shape
+    /// (`test_convert_late_tool_result_merges_into_its_calling_step`); the
+    /// session exporter only inspected the next event of the same group, so
+    /// the observation vanished from the export.
+    #[test]
+    fn session_export_merges_a_late_result_across_a_new_conversation() {
+        let events = vec![
+            event_with_ids(
+                1,
+                1_000_000_000,
+                Some("conv-a"),
+                Some("resp-1"),
+                Some("read /tmp/a"),
+                Some(tool_call_turn("tc-late")),
+                None,
+            ),
+            event_with_ids(
+                2,
+                3_000_000_000,
+                Some("conv-b"),
+                Some("resp-2"),
+                Some("actually, hold on"),
+                None,
+                Some(replayed_response("tc-late")),
+            ),
+        ];
+
+        let doc = convert_session_to_atif("session-late", events).unwrap();
+
+        let agent_steps: Vec<&Step> = doc
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::Agent)
+            .collect();
+        assert_eq!(agent_steps.len(), 2);
+
+        let observation = agent_steps[0]
+            .observation
+            .as_ref()
+            .expect("the late result must attach to the step that issued the call");
+        assert_eq!(observation.results.len(), 1);
+        assert_eq!(
+            observation.results[0].source_call_id.as_deref(),
+            Some("tc-late")
+        );
+        assert!(
+            agent_steps[1].observation.is_none(),
+            "the interjection's own turn must not claim the result"
+        );
     }
 
     #[test]

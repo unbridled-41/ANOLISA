@@ -77,8 +77,10 @@ pub fn normalize(
 /// Whether the native loop stops before visiting remaining callbacks.
 pub fn stops_before(adapter: &str, output: Option<&HookOutput>, on_error: &str) -> bool {
     match (adapter, output) {
-        ("pi", Some(output)) => serde_json::from_slice::<Value>(&output.stdout)
-            .is_ok_and(|value| value["block"] == true),
+        ("pi" | "deepseek-harness", Some(output)) => {
+            serde_json::from_slice::<Value>(&output.stdout)
+                .is_ok_and(|value| value["block"] == true)
+        }
         ("openclaw", Some(output)) => {
             if !matches!(output.exit, Exit::Code(0)) {
                 return on_error == "block";
@@ -100,13 +102,15 @@ pub fn stops_before(adapter: &str, output: Option<&HookOutput>, on_error: &str) 
                 _ => on_error == "block",
             }
         }
-        ("qoder-sdk" | "claude-sdk" | "agentscope" | "qwenpaw", Some(output)) => {
+        ("qoder-sdk" | "claude-sdk" | "agentscope" | "qwenpaw" | "codex", Some(output)) => {
             matches!(output.exit, Exit::Code(2))
                 || (on_error == "block" && !matches!(output.exit, Exit::Code(0)))
         }
-        ("pi" | "openclaw" | "qoder-sdk" | "claude-sdk" | "agentscope" | "qwenpaw", None) => {
-            on_error == "block"
-        }
+        (
+            "pi" | "deepseek-harness" | "openclaw" | "qoder-sdk" | "claude-sdk" | "agentscope"
+            | "qwenpaw" | "codex",
+            None,
+        ) => on_error == "block",
         _ => false,
     }
 }
@@ -132,6 +136,23 @@ pub fn response(
     native: &Value,
     diagnostics: &mut dyn std::io::Write,
 ) -> Result<HookOutput> {
+    if let Some(input) = output.get("input_replacement").cloned() {
+        let mut output = output;
+        output
+            .as_object_mut()
+            .ok_or("invalid step response")?
+            .remove("input_replacement");
+        let response = response(
+            adapter,
+            event,
+            on_error,
+            output,
+            adapter_id,
+            native,
+            diagnostics,
+        )?;
+        return crate::input::reply(adapter_id, event, response, input);
+    }
     if !(matches!(on_error, "report" | "block")
         || (event == "tool.after" && on_error == "withhold_result"))
     {
@@ -148,7 +169,7 @@ pub fn response(
                 Some("exit" | "incomplete_input" | "provider" | "protocol")
             ) || (output["failure"] == "transport"
                 && output["failure_detail"] == "deadline_exceeded"));
-        if adapter_id == "pi"
+        if matches!(adapter_id, "pi" | "deepseek-harness")
             && provider_fault
             && event == "tool.after"
             && on_error == "withhold_result"
@@ -205,6 +226,13 @@ pub fn response(
             (None, Some(signal @ 1..=64)) => Exit::Signal(signal as i32),
             _ => return Err("invalid native exit status".into()),
         };
+        if event == "tool.before"
+            && serde_json::from_slice::<Value>(&stdout).is_ok_and(|value| {
+                value.get("aw_checked_input").is_some() || value.get("aw_updated_input").is_some()
+            })
+        {
+            return Err("native callback cannot attest checked input".into());
+        }
         let sdk_before = matches!(adapter_id, "claude-sdk" | "qoder-sdk") && event == "tool.before";
         // Validate before success so fail-closed vetoes use the existing event closure.
         if sdk_before {
@@ -243,8 +271,8 @@ pub fn response(
                 return Err("invalid_native_response".into());
             }
         }
-        if adapter_id == "pi" {
-            validate_pi_native(event, &exit, &stdout)?;
+        if matches!(adapter_id, "pi" | "deepseek-harness") {
+            validate_native_block_directive(event, &exit, &stdout)?;
         }
         return Ok(HookOutput {
             exit,
@@ -280,8 +308,8 @@ pub fn response(
     }
     let blocked = effects.iter().any(|effect| effect["type"] == "block");
     if blocked {
-        if !matches!(event, "input.submit" | "tool.before") {
-            return Err("block requires a submission or pre-tool event".into());
+        if !matches!(event, "input.submit" | "tool.before" | "security.violation") {
+            return Err("block requires an admitted blocking event".into());
         }
         let mut reply = adapter.reply(true);
         if let Some(text) = effects
@@ -299,9 +327,9 @@ pub fn response(
 
 // Validate raw native output before returning to the SDK so an invalid directive
 // and a nonzero/signal exit share the same error action and early-close path.
-fn validate_pi_native(event: &str, exit: &Exit, stdout: &[u8]) -> Result<()> {
+fn validate_native_block_directive(event: &str, exit: &Exit, stdout: &[u8]) -> Result<()> {
     if !matches!(exit, Exit::Code(0)) {
-        return Err("Pi native callback must exit zero".into());
+        return Err("native block callback must exit zero".into());
     }
     let value: Value = if stdout.is_empty() {
         serde_json::json!({})
@@ -310,7 +338,7 @@ fn validate_pi_native(event: &str, exit: &Exit, stdout: &[u8]) -> Result<()> {
     };
     let object = value
         .as_object()
-        .ok_or("Pi native directive must be an object")?;
+        .ok_or("native block directive must be an object")?;
     if object
         .keys()
         .any(|key| !matches!(key.as_str(), "block" | "reason"))
@@ -318,7 +346,7 @@ fn validate_pi_native(event: &str, exit: &Exit, stdout: &[u8]) -> Result<()> {
         || object.get("reason").is_some_and(|value| !value.is_string())
         || (event == "tool.after" && value["block"] == true)
     {
-        return Err("unsupported Pi native directive".into());
+        return Err("unsupported native block directive".into());
     }
     Ok(())
 }

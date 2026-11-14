@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "packaging/rpm/cosh-ng.spec.in"
 SECTION = re.compile(
-    r"^%(?:package|description|prep|build|install|files|preun|post|postun|posttrans|changelog)(?:\s|$)",
+    r"^%(?:package|description|prep|build|install|files|pre|preun|post|postun|posttrans|changelog)(?:\s|$)",
     re.MULTILINE,
 )
 
@@ -27,6 +27,11 @@ def section(source: str, header: str) -> str:
 
 def expand(source: str, macros: dict[str, str]) -> str:
     """Expand only the path macros used by the fixture's install recipe."""
+    source = re.sub(
+        r"(?ms)^%if %\{with login_lifecycle\}\n(.*?)^%endif\n",
+        lambda match: match[1] if macros.get("with login_lifecycle") == "1" else "",
+        source,
+    )
     for _ in range(8):
         updated = re.sub(r"%\{([^}]+)\}", lambda m: macros.get(m[1], m[0]), source)
         if updated == source:
@@ -55,6 +60,7 @@ class RpmPackageTests(unittest.TestCase):
     def test_single_package_owns_runtime_lifecycle(self) -> None:
         meta = section(self.source, "Name:           cosh-ng").split("%description", 1)[0]
         self.assertIn("Provides:       anolisa-component(cosh-ng)", meta)
+        self.assertIn("%bcond_without login_lifecycle", self.source)
         self.assertNotIn("%package ", self.source)
         self.assertNotIn("Requires:       %{name}-", meta)
         self.assertNotIn("Conflicts:      %{name}", meta)
@@ -65,8 +71,11 @@ class RpmPackageTests(unittest.TestCase):
         self.assertIn('if [ "$1" -eq 0 ]; then', section(self.source, "%preun"))
 
     def test_install_recipe_owns_every_file_once(self) -> None:
-        for custom in (False, True):
-            with self.subTest(custom_roles=custom), tempfile.TemporaryDirectory() as temporary:
+        for custom, enabled in ((False, True), (True, True), (False, False), (True, False)):
+            with (
+                self.subTest(custom_roles=custom, lifecycle=enabled),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 work = Path(temporary)
                 source = work / "source"
                 source.mkdir()
@@ -75,6 +84,9 @@ class RpmPackageTests(unittest.TestCase):
                     "LICENSE",
                     "README.md",
                     "packaging/payload.sh",
+                    "packaging/login/login-preflight",
+                    "packaging/login/login-capability.json",
+                    "packaging/bash/cosh-integration.bash",
                     "packaging/systemd/cosh-gateway@.service.in",
                     "skills/manage-task-checkpoints/SKILL.md",
                 ):
@@ -89,9 +101,11 @@ class RpmPackageTests(unittest.TestCase):
                     binary.chmod(0o755)
                 macros = {
                     "name": "cosh-ng",
+                    "with login_lifecycle": "1" if enabled else "0",
                     "buildroot": str(stage),
                     "_bindir": "/usr/bin",
                     "_docdir": "/usr/share/doc",
+                    "_libexecdir": "/usr/libexec",
                     "_datadir": "/usr/share",
                     "_unitdir": "/usr/lib/systemd/system",
                     "_libexecdir_cosh": (
@@ -109,7 +123,14 @@ class RpmPackageTests(unittest.TestCase):
                 )
                 ownership = file_entries(self.source, "%files", macros)
                 files = [p for p in stage.rglob("*") if p.is_symlink() or p.is_file()]
-                self.assertEqual(len(files), 11)
+                self.assertFalse((stage / "usr/bin/cosh-switch").exists())
+                self.assertEqual(len(files), 13 if enabled else 12)
+                proof = stage / "usr/share/cosh/login-capability.json"
+                self.assertEqual(proof.is_file(), enabled)
+                if enabled:
+                    self.assertEqual(proof.stat().st_mode & 0o777, 0o644)
+                self.assertFalse((stage / "etc/profile.d").exists())
+                self.assertFalse((stage / "etc/bashrc").exists())
                 for path in files:
                     installed = "/" + str(path.relative_to(stage))
                     matches = sum(
@@ -127,7 +148,8 @@ class RpmPackageTests(unittest.TestCase):
                 self.assertEqual(
                     os.readlink(stage / "usr/bin/cosh"), macros["_libexecdir_cosh"] + "/cosh-shell"
                 )
-                self.assertIn("cosh-ng)", (stage / "usr/bin/cosh-switch").read_text())
+                preflight = stage / "usr/libexec/cosh/login-preflight"
+                self.assertIn(macros["_libexecdir_cosh"] + "/cosh-shell", preflight.read_text())
                 resources = stage / macros["_libexecdir_cosh"].lstrip("/") / "resources.conf"
                 self.assertEqual(
                     resources.read_text().splitlines(),
@@ -165,6 +187,20 @@ class RpmPackageTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.stdout.splitlines(), ["cosh-ng"])
+            for enabled in (True, False):
+                command = ["rpmspec", "-q", "--rpms", "--provides"]
+                if not enabled:
+                    command.extend(["--without", "login_lifecycle"])
+                command.extend(
+                    [
+                        "--define", "_unitdir /usr/lib/systemd/system",
+                        "--define", "systemd_preun() %{nil}", str(spec),
+                    ]
+                )
+                provides = subprocess.run(
+                    command, check=True, capture_output=True, text=True, timeout=30,
+                ).stdout.splitlines()
+                self.assertEqual("cosh-login-lifecycle-v1" in provides, enabled)
 
 
 if __name__ == "__main__":

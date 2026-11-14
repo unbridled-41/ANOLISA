@@ -16,6 +16,14 @@ archive's absolute `templates/` directory, then choose a template for `aw config
 | Check tool commands | `--template "$AW_TEMPLATE_DIR/sec-core.json"` | [Security](security.md) |
 | Enable both | `--template "$AW_TEMPLATE_DIR/sec-core-tokenless.json"` | [Tokenless](tokenless.md) and [security](security.md) |
 
+For OpenClaw alone, use `tokenless-openclaw.json` or
+`sec-core-tokenless-openclaw.json`. With both Qoder and OpenClaw in one
+configuration, `tokenless.json` rewrites Qoder commands in the same call and
+gives OpenClaw a block-and-retry suggestion. Add sec-core with
+`sec-core-tokenless.json` to scan both Shell tools before execution.
+`sec-core-tokenless-openclaw.json` scans both tools and uses block-and-retry
+for both Agents.
+
 For Provider configuration, use its actual installation prefix in `--prefix`.
 Supply the backend paths, socket and RTK checksum using the `--template-var`
 arguments shown in those guides. `PROVIDERS_DIR` selects the installed Provider
@@ -89,6 +97,11 @@ Each AW launch installs a separate temporary plugin and preserves existing
 plugin names and settings. QwenPaw keeps ownership of `config.json`, plugin
 configuration and dynamic MCP updates. Select covered tools explicitly; native
 permissions continue to apply to tools outside those selectors.
+
+### DeepSeek Harness
+
+Use the [headless DSH integration guide](../../../developer-guide/en/aw/agents/deepseek-harness.md)
+for the verified version, `aw run` command and sec-core tool policy.
 
 ## Custom rules and service deployment
 

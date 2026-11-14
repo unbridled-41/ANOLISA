@@ -85,7 +85,7 @@ pub trait Host: Send + Sync {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|_| GatewayError::unavailable("cannot read host boot identity"))?;
         let namespace = std::fs::read_link(format!("/proc/{pid}/ns/pid")).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
+            if crate::processes::process_vanished(&error) {
                 GatewayError::process_exited()
             } else {
                 GatewayError::unavailable("cannot read process PID namespace")
@@ -345,9 +345,7 @@ impl Host for SystemHost {
     fn process_cgroup(&self, pid: u32) -> Result<String, GatewayError> {
         let path = PathBuf::from(format!("/proc/{pid}/cgroup"));
         let text = std::fs::read_to_string(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound
-                && std::path::Path::new("/proc/self/cgroup").is_file()
-            {
+            if crate::processes::process_vanished(&error) {
                 GatewayError::process_exited()
             } else {
                 GatewayError::io("cannot read", &path, &error)
@@ -531,6 +529,32 @@ mod tests {
     use super::*;
     use rustix::process::{WaitOptions, waitpid};
 
+    fn process_disappeared(error: &std::io::Error) -> bool {
+        // procfs can return ESRCH when the task disappears after opening stat.
+        error.kind() == std::io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+    }
+
+    #[test]
+    fn process_disappearance_errors() {
+        use rustix::io::Errno;
+        use std::io::{Error, ErrorKind};
+
+        for (error, disappeared) in [
+            (Error::from(ErrorKind::NotFound), true),
+            (Error::from_raw_os_error(Errno::NOENT.raw_os_error()), true),
+            (Error::from_raw_os_error(Errno::SRCH.raw_os_error()), true),
+            (
+                Error::from_raw_os_error(Errno::ACCESS.raw_os_error()),
+                false,
+            ),
+            (Error::from_raw_os_error(Errno::IO.raw_os_error()), false),
+            (Error::from(ErrorKind::Other), false),
+        ] {
+            assert_eq!(process_disappeared(&error), disappeared, "{error:?}");
+        }
+    }
+
     fn assert_dead_and_reaped(marker: &std::path::Path) {
         let pids: Vec<Pid> = std::fs::read_to_string(marker)
             .unwrap()
@@ -547,7 +571,7 @@ mod tests {
             let path = format!("/proc/{pid}/stat");
             loop {
                 match std::fs::read_to_string(&path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) if process_disappeared(&error) => break,
                     Ok(stat)
                         if stat.rsplit_once(") ").is_some_and(|(_, rest)| {
                             matches!(rest.as_bytes().first(), Some(b'Z' | b'X'))
@@ -562,6 +586,19 @@ mod tests {
                 std::thread::sleep(COMMAND_POLL);
             }
         }
+    }
+
+    #[test]
+    fn reaped_process_identity_lookups_report_process_exit() {
+        let host = SystemHost;
+        let own = std::process::id();
+        assert!(host.process_cgroup(own).unwrap().starts_with('/'));
+        assert!(host.process_fence(own).unwrap().1.starts_with("pid:["));
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(host.process_cgroup(pid).unwrap_err().is_process_exited());
+        assert!(host.process_fence(pid).unwrap_err().is_process_exited());
     }
 
     #[test]

@@ -105,7 +105,7 @@ checksum = "23b62fc65de8e4e7f52534fb52b0f3ed04746ae267519eef2a83941e8085068b"
 
 [[package]]
 name = "asc-action-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-types",
  "asc-observability",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "asc-action-types"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "asc-agentsight-client"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-agentsight-protocol",
  "asc-policy-target-contracts",
@@ -143,14 +143,14 @@ dependencies = [
 
 [[package]]
 name = "asc-agentsight-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "asc-capability-code-scan"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "asc-capability-pii-scan"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "asc-capability-prompt-scan"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "asc-capability-skill-sec"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -227,13 +227,14 @@ dependencies = [
 
 [[package]]
 name = "asc-cli"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
  "asc-capability-pii-scan",
  "asc-capability-prompt-scan",
  "asc-capability-skill-sec",
+ "asc-credential-store",
  "asc-daemon",
  "asc-daemon-client",
  "asc-daemon-core",
@@ -257,6 +258,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "nix",
  "rustix",
  "serde",
  "serde_json",
@@ -273,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "asc-credential-store"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ring",
  "rustix",
@@ -285,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -336,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon-client"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-daemon-protocol",
  "asc-observability",
@@ -355,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -376,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon-handler"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-action-runtime",
  "asc-action-types",
@@ -403,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "asc-policy-types",
@@ -415,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "asc-daemon-service"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -425,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "asc-event-log"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-observability",
  "asc-security-events",
@@ -440,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "asc-event-sink"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-event-log",
  "asc-observability",
@@ -461,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "asc-foundation-types"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -470,9 +472,10 @@ dependencies = [
 
 [[package]]
 name = "asc-gateway-plan"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-credential-store",
+ "asc-policy-cedar",
  "asc-policy-types",
  "serde",
  "serde_json",
@@ -481,11 +484,12 @@ dependencies = [
 
 [[package]]
 name = "asc-gateway-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-credential-store",
  "asc-gateway-plan",
  "asc-pap",
+ "asc-policy-cedar",
  "asc-policy-repository",
  "asc-policy-repository-sqlite",
  "asc-policy-target-contracts",
@@ -494,13 +498,16 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "asc-intent"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-model-client",
  "cedar-policy",
@@ -512,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "asc-model-client"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "log",
  "reqwest",
@@ -526,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "asc-observability"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-security-events",
  "chrono",
@@ -544,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "asc-os-permission-types"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "serde",
@@ -553,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "asc-pap"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "asc-policy-cedar",
@@ -562,6 +569,7 @@ dependencies = [
  "asc-policy-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
  "uuid",
@@ -569,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "asc-pcp"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-agentsight-client",
  "asc-foundation-types",
@@ -586,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "asc-pdp-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-daemon-protocol",
  "asc-policy-cedar",
@@ -601,11 +609,15 @@ dependencies = [
 
 [[package]]
 name = "asc-pep-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-daemon-client",
  "asc-daemon-protocol",
+ "asc-pdp-runtime",
+ "asc-policy-cedar",
+ "asc-policy-types",
  "asc-sandbox-types",
+ "cedar-policy",
  "clap",
  "linux-sandbox",
  "rustix",
@@ -617,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "asc-persistence-sqlite"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-daemon-core",
  "asc-observability",
@@ -634,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-cedar"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-policy-types",
  "cedar-policy",
@@ -646,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-repository"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "asc-policy-types",
@@ -659,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-repository-sqlite"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-agentsight-client",
  "asc-foundation-types",
@@ -684,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "asc-pap",
@@ -698,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-target-contracts"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-policy-types",
  "serde_json",
@@ -706,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-translator-agentsight"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-agentsight-protocol",
  "asc-policy-cedar",
@@ -718,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "asc-policy-types"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-foundation-types",
  "serde",
@@ -728,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "asc-sandbox-types"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-os-permission-types",
  "serde",
@@ -736,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "asc-security-events"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "rustix",
@@ -749,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "asc-security-summary"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "asc-security-events",
  "chrono",
@@ -758,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "asc-sqlite-kernel"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rusqlite",
  "rustix",
@@ -769,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "asc-telemetry"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "nix",
  "serde",

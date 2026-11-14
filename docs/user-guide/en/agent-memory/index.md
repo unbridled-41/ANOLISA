@@ -310,13 +310,17 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `mem_write` | `path`, `content` | `overwrite` | `wrote N bytes to <path>` |
 | `mem_append` | `path`, `content` | — | `appended N bytes to <path>` |
 | `mem_edit` | `path`, `old_str`, `new_str` | — | `edited <path>` (`old_str` must match exactly once) |
-| `mem_list` | — | `dir`, `recursive`, `glob` | `{name, type, size, mtime}` array, capped at 5000 entries (a truncated listing warns in the log) |
+| `mem_list` | — | `dir`, `recursive`, `glob` | `{name, type, size, mtime}` array, capped at 5000 entries (the log warns only if additional matching entries are omitted; exactly 5000 does not warn) |
 | `mem_grep` | `pattern` | `dir`, `type`, `max`, `case_insensitive` | `{path, line, text}` array |
 | `mem_diff` | `path1`, `path2` | — | unified diff |
 | `mem_mkdir` | `path` | — | `created <path>` |
 | `mem_remove` | `path` | `recursive` | `removed <path>` |
 | `mem_promote` | `session_path`, `store_path` | — | copy session scratch file into a new persistent-store file |
 | `mem_session_log` | — | — | current session JSONL |
+
+`mem_grep` skips lines containing invalid UTF-8 and continues searching later
+lines in the same file. Returned line numbers are 1-based positions in the
+original file, including skipped lines.
 
 `mem_write(overwrite=false)` and `mem_promote` refuse existing destinations. On a
 write failure, they remove the incomplete file they created so the same request
@@ -382,9 +386,26 @@ substring-search fallback.
 
 Snapshot restore preserves read-only directory modes. Disposable extraction
 staging is cleaned after a failed attempt and before a retry. The previous live
-tree remains recoverable under `.anolisa/trash/` with its original modes;
-manual purging of read-only directories may require restoring owner write
-permission first. Restore does not automatically collect retained trash.
+tree remains recoverable with its original modes in a separate directory under
+`.anolisa/trash/` for each successful restore, including repeated restores of the
+same snapshot within one second. Existing recovery directories are never reused
+or overwritten. If trash creation or a move fails, the remaining old data stays
+in that attempt's `.anolisa/.<id>.rollback.<timestamp>[-<suffix>]/` directory;
+warnings identify the retained paths. If a rollback directory cannot be reserved,
+restore fails before moving live files. Older rollback leftovers remain in place
+and do not block new restores. Restore does not automatically delete retained
+trash or rollback data. Manual purging of read-only directories may require
+restoring owner write permission first.
+
+Restores and snapshot reclamation share a per-mount lock across `serve` processes.
+If that lock is busy, restore fails before changing files with
+`another snapshot restore or reclaim is in progress`; retry after the operation
+finishes. Reclamation skips that mount-open sweep if it cannot acquire the lock.
+The lock is released when its holder exits, but `.anolisa/.restore.lock` remains:
+do not delete this file while any process is using the mount. Restart all `serve`
+processes sharing the mount after upgrading, since older versions ignore the lock.
+This coordination covers restores and reclamation; pause other file writers when
+you need the restored tree to remain unchanged.
 
 ### Sovereignty & import/export (13)
 
@@ -448,6 +469,25 @@ A missing store root is an export error, not an empty archive. Scan and read fai
 `mem_export` stops with an error naming the affected path if it cannot scan a directory or read a Markdown file as UTF-8. It does not return a partial AMA archive as a successful export. Check file permissions or encoding and retry. Category and source filters require reading metadata, so a read failure can also block a filtered export. Metadata directories and non-Markdown files remain excluded.
 
 Rust API callers using `ExportFilter.include_tasks = false` exclude the `tasks/` subtree before traversal or reading, so unreadable task directories or files do not block the requested export. The MCP `mem_export` tool includes tasks and retains error reporting for them.
+
+`mem_import` checks memory and task paths before an `overwrite` clears existing
+Markdown files. Empty, non-Markdown, duplicate, absolute, traversal, reserved and
+symlink paths skip the whole-store clear. Valid entries still import, including
+replacing matching paths, while invalid entries appear in the error list.
+`dry_run=true` performs validation without writing or creating a backup.
+For a valid overwrite, an existing regular Markdown file that will be cleared
+may become a directory, such as `notes/old.md` for `notes/old.md/new.md`.
+The preview accounts for this conversion; symlink ancestors remain invalid.
+
+Before clearing a valid archive's destination, `overwrite` saves an AMA backup
+under `<mount>/.anolisa/import-backup-<ULID>.json`, readable only by its owner.
+Export, write or sync failure aborts before clearing or importing. The result
+includes a `Backup:` path after a successful backup and clear. To recover missing
+memories, read that file on the host and pass its contents as `json_data` to
+`mem_import` with `strategy="skip-existing"`; existing paths remain unchanged.
+Backups remain until manually removed. This is not an automatic rollback:
+later write failures can leave a partial import. Pause other writers during an
+overwrite to keep the backup and imported state consistent.
 
 ### Error code semantics
 
@@ -527,7 +567,16 @@ With git on, `mem_log` exposes change history and `mem_revert` gives the agent a
 
 ### Full-text search
 
-SQLite FTS5 BM25 index, sub-millisecond queries. A background tokio task watches the mount via `inotify`; events are debounced 200 ms and applied in a single transaction. Tokenizer is `trigram` (substring matching for ≥3-char terms). The trigram tokenizer emits one token per 3-character window, so a query term shorter than 3 characters (common for CJK words like "花名" / "小云") produces no tokens and would silently match nothing; `memory_search` detects this case and falls back to a `body LIKE '%term%'` substring scan so short CJK queries still recall. `IN_Q_OVERFLOW` triggers a full rescan — events are never silently dropped.
+SQLite FTS5 BM25 index. A background thread watches the mount via `inotify`; events are debounced 200 ms, with each file's index update applied transactionally. Tokenizer is `trigram` (substring matching for ≥3-char terms). The trigram tokenizer emits one token per 3-character window, so a query term shorter than 3 characters (common for CJK words like "花名" / "小云") produces no tokens and would silently match nothing; `memory_search` detects this case and falls back to a `body LIKE '%term%'` substring scan so short CJK queries still recall. `IN_Q_OVERFLOW` triggers a full rescan.
+
+Failed index writes during startup or incremental updates schedule an automatic
+rescan, with retry delays doubling from 1 second up to 64 seconds after repeated
+failures. Recovery does not require changing the file again or restarting the
+server. While a known failure awaits recovery, `memory_search` reports
+`search index is incomplete` instead of successful empty or partial results.
+Retry after recovery, or use `mem_grep` to search the files directly. If the error
+persists, inspect the index worker warnings for the failing path and database
+error; the memory files remain available through file tools.
 
 Only supported UTF-8 text files up to 4 MiB are indexed. When an indexed file grows beyond this limit or becomes non-UTF-8, its old text and vector entries are removed and the eviction is logged; the file itself is unchanged. The default 16 MiB write limit and the per-call append limit do not guarantee search eligibility: repeated appends can grow a file past 4 MiB. Split large memories into smaller files to keep them searchable.
 
@@ -633,9 +682,22 @@ structurally valid — a full gzip stream whose entries all pass the same
 pre-extraction checks `restore` applies (only regular files and directories;
 no `..` traversal, duplicate file names, or a file landing on an
 already-extracted path) — by
-regenerating the sidecar from the archive's own metadata. An archive that
-fails those checks is also refused by `restore`, so it is deleted instead of
-being repaired into a snapshot that could never restore.
+regenerating the sidecar from the archive's own metadata. These checks also
+apply to archives with parseable sidecars once the archives exceed the age
+guard. Invalid archives are deleted and counted separately in the sweep
+summary; their sidecars are removed once they too exceed the age guard.
+Valid pairs are retained without rewriting their metadata. This validation
+reads each eligible archive in full during mount opening.
+If opening or reading an archive fails, the sweep retains the archive and
+its sidecar, logs a warning, and counts a validation failure. Permission or
+storage access failures do not establish corruption; restore access and
+open the mount again to retry validation.
+
+`mem_snapshot_list` excludes entries without a regular archive file; it does
+not perform a full integrity check. A directory named `<id>.tar.gz` cannot
+keep a stale sidecar alive: the sweep removes the sidecar after its age guard
+but leaves the directory and its contents untouched.
+
 The repair itself stages its replacement as a hidden `.memory-write-*.tmp`
 file next to the archives; one left by a hard kill mid-repair is removed by
 later sweeps once it ages past the guard.

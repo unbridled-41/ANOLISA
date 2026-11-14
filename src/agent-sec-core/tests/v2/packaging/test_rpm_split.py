@@ -144,7 +144,7 @@ class RpmSplitTests(unittest.TestCase):
             "/usr/lib/systemd/system/agent-sec-gateway.service": "agent-sec-core",
             "/usr/lib/systemd/system/agent-sec-core.service.d/gateway.conf": "agent-sec-core",
             "/usr/share/anolisa/sec-core/gateway/asc_gateway_addon.py": "agent-sec-core",
-            "/usr/share/anolisa/sec-core/gateway/github-policy.json": "agent-sec-core",
+            "/usr/share/anolisa/sec-core/gateway/github.cedar": "agent-sec-core",
             "/usr/share/anolisa/sec-core/gateway/install-mitmproxy.sh": "agent-sec-core",
             "/usr/share/anolisa/extensions/agent-sec-core/hooks/code_scanner_hook.py": "agent-sec-plugins",
             "/opt/agent-sec/openclaw-plugin/dist/index.js": "agent-sec-plugins",
@@ -247,7 +247,7 @@ class RpmSplitTests(unittest.TestCase):
                 "gateway/asc_gateway_addon.py",
                 "gateway/asc_gateway_policy.py",
                 "gateway/mitmproxy.provenance",
-                "gateway/github-policy.json",
+                "gateway/github.cedar",
                 "gateway/install-mitmproxy.sh",
             )
             for name in artifacts:
@@ -255,6 +255,10 @@ class RpmSplitTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture\n")
                 path.chmod(0o755)
+            shutil.copy2(
+                ROOT / "cosh-extension/hooks/sandbox_paths.py",
+                build / "cosh-extension/hooks/sandbox_paths.py",
+            )
             for name in ("agent-sec-gateway.service.in", "gateway.conf"):
                 shutil.copy2(
                     ROOT / "packaging/gateway" / name, build / "gateway" / name

@@ -6,6 +6,13 @@ AW 在原生 Agent 的工具调用前后执行策略。Adapter 接收原生回�
 绑定和事件，Host 调用 Provider，最后由 Adapter 将结果交还 Agent。
 模型调用、工具调度和权限审批仍由 Agent 负责。
 
+DeepSeek Harness 通过本次启动专属插件接入提交与工具事件。配置
+`security.violation` 时，Adapter 还在 Agent 进程中安装 Node 预加载；固定构建的
+Agent loop 在原生结果最终处理后、Session 提交前等待 Provider 终检。预加载注册后
+从继承的 `NODE_OPTIONS` 中移除，Provider 使用原始启动环境。该路径覆盖 DSH
+`0.2.1-rc.5` 已验证的 headless 顶层工具交付；结果身份、生命周期与排除路径见
+[Adapter 分派](adapters/adapter-dispatch.md#原生启动证据)。
+
 常驻 SDK 通过服务端的受管根 binding 和任务子 binding 接入。根策略保持不可变；
 每个任务固定独立 cwd 和环境，保留重放阻断记录到释放，所属进程退出后执行回收。
 原生工厂继续由 Adapter 负责，见[任务生命周期](runtime/local-service.md#常驻宿主与任务-scope)。
@@ -40,7 +47,7 @@ AW 框架包含 `crates/` 下的 10 个 crate。具体 Provider 在 `providers/`
 依赖列省略 `aw-` 前缀。`aw-package` 的测试还依赖 `aw-service`，`aw-provider` 的测试还依赖 `aw-config`，CLI 集成测试还使用
 `aw-contracts` 和 `reqwest`。底层库不依赖 `aw-cli`；`aw` 在进程内调用配置与本地扩展管理 API。
 独立 `aw-package` 可执行文件已删除，Rust crate 保留。`make -C src/aw build`
-构建 AW CLI；`make -C distribution aw-packages VERSION=0.1.0 COMPONENTS='core sec-core tokenless' OUTPUT="$PWD/target/aw-packages"` 通过
+构建 AW CLI；`make -C distribution aw-packages VERSION=0.1.1 COMPONENTS='core sec-core tokenless' OUTPUT="$PWD/target/aw-packages"` 通过
 `distribution/packaging/aw/` 下的普通脚本组装独立归档。
 扩展记录、文件校验和持久事务位于 `aw-package` 私有 `store` 模块；
 运行时文件读锁位于 `aw-exec`，不依赖包数据库访问。
@@ -224,6 +231,7 @@ Adapter 在原生调度前登记模型产生的身份，等待原生命令队列
 [策略更新契约](runtime/policy-reload.md#qoder-sdk-请求准入)。
 
 [常驻 SDK 生命周期](adapters/resident-sdk.md) 说明 Pi、Claude 和普通 Qoder SDK Query 的每客户端任务准入、回调路由、fail-close 与释放边界。
+[Codex CLI Adapter](adapters/codex-adapter.md) 通过原生命令 Hook 执行有序 AW 步骤，并在启动本地会话前检查原始输入边界。
 
 [Claude 受管 MCP handler](adapters/claude-mcp.md) 使用明确来源、任务所属调用身份和可靠成功状态，复用现有 Provider 链路采纳结果。
 

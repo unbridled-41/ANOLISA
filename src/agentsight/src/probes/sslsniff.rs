@@ -367,6 +367,9 @@ pub struct SslSniff {
     /// Resolved static offsets and whether to attach the handshake probes.
     /// Avoids repeating whole-binary scans for each newly discovered PID.
     static_attach_offsets: HashMap<FileKey, (StaticSslOffsets, bool)>,
+    /// Offsets learned by earlier scans, persisted across restarts so a
+    /// previously scanned binary attaches synchronously at discovery (#9762).
+    learned_offsets: LearnedOffsets,
     traced_files: HashSet<FileKey>,
     /// Maps pid -> files that were attached for this pid.
     /// Used to clean up traced_files when the process exits.
@@ -443,6 +446,7 @@ impl SslSniff {
             skel,
             attachments: HashMap::default(),
             static_attach_offsets: HashMap::default(),
+            learned_offsets: LearnedOffsets::load(crate::config::ssl_offsets_learned_path()),
             traced_files: HashSet::default(),
             pid_inodes: HashMap::default(),
             pid_identities: HashMap::default(),
@@ -712,13 +716,65 @@ impl SslSniff {
     /// Install completed scans and return identity-bearing admissions.
     pub(crate) fn poll_pending_scan_admissions(&mut self) -> Vec<SslAdmission> {
         let mut admitted = Vec::new();
-        for _ in 0..4 {
+        // Drain every completed scan, not a fixed quota: the result channel is
+        // bounded and the single scan worker blocks on send once it fills. A
+        // per-tick quota let results pile up under process churn, stalling the
+        // worker and delaying installs past short-lived agents' exit (#9762).
+        // Installing already-computed results is cheap, so drain to empty.
+        loop {
             let Some(scanned) = self.scans.try_recv() else {
                 break;
             };
             let file = scanned.key;
             let path = scanned.path();
-            if !self.pid_inodes.values().any(|files| files.contains(&file)) {
+            let has_owner = self.pid_inodes.values().any(|files| files.contains(&file));
+            if !has_owner {
+                // The originating process exited before its scan was installed.
+                // A verified offset set is inode-global, so keep it cached and
+                // attach the global uprobe anyway: the next process mapping this
+                // binary is then captured without re-racing the scan. Discarding
+                // here made every short-lived agent re-scan and lose its first
+                // call under load (#9762).
+                if let ExecutableScan::Offsets(offsets) = &scanned.outcome {
+                    if scanned.unchanged_at_attach() {
+                        self.static_attach_offsets
+                            .insert(file, (offsets.clone(), false));
+                        match attach_static_ssl_by_offset(&mut self.skel, &path, offsets, false, -1)
+                        {
+                            Ok(links) => {
+                                log::debug!(
+                                    "Installing static SSL offsets for inode {file:?} after its owner exited"
+                                );
+                                if self.attachments.contains_key(&file) {
+                                    self.stale_reattachs += 1;
+                                }
+                                self.record_attach(file, links);
+                                self.traced_files.insert(file);
+                                self.scan_retry_after.remove(&file);
+                                // The owner is gone, but the verified offsets
+                                // must outlive it: persist them so the next
+                                // process mapping this binary — even after a
+                                // service restart — attaches synchronously.
+                                self.learned_offsets.record(&path, offsets);
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Attach asynchronously detected SSL inode {file:?}: {error:#}"
+                                );
+                                // Unmark for a later retry: a marked file with no
+                                // attachment is negatively cached and would never
+                                // be probed again.
+                                self.traced_files.remove(&file);
+                                self.scan_retry_after.remove(&file);
+                                if !self.attachments.contains_key(&file) {
+                                    self.static_attach_offsets.remove(&file);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                log::debug!("Discarding scan result for inode {file:?} with no remaining owner");
                 self.traced_files.remove(&file);
                 self.scan_retry_after.remove(&file);
                 // No owner remains to route this through detach_process, so
@@ -756,6 +812,9 @@ impl SslSniff {
                             self.traced_files.insert(file);
                             self.scan_retry_after.remove(&file);
                             admitted.extend(self.take_ready_pids(file));
+                            // Persist after admission so learning never delays
+                            // routing the installed offsets to waiting pids.
+                            self.learned_offsets.record(&path, &offsets);
                         }
                         Err(error) => {
                             log::warn!(
@@ -1190,6 +1249,39 @@ impl SslSniff {
                                     }
                                 };
                             }
+                            // A previously learned offset set attaches
+                            // synchronously, exactly like the shipped table: a
+                            // warm agent's first TLS call can precede the
+                            // asynchronous scan of its binary (#9762). Learned
+                            // entries come from scans, so they attach with the
+                            // scan-install ABI (no handshake probes), not the
+                            // codex-table one.
+                            if let Some(off) = self.learned_offsets.lookup(path) {
+                                log::info!(
+                                    "[attach_process] pid={pid}: learned offset cache matched for {path} \
+                                     (write=0x{:x}, read=0x{:x}, handshake=0x{:x})",
+                                    off.ssl_write,
+                                    off.ssl_read,
+                                    off.ssl_do_handshake
+                                );
+                                self.static_attach_offsets
+                                    .insert(file, (off.clone(), false));
+                                return match attach_static_ssl_by_offset(
+                                    &mut self.skel,
+                                    path,
+                                    &off,
+                                    false,
+                                    -1,
+                                ) {
+                                    Ok(links) => AttachOutcome::Attached(links),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[attach_process] pid={pid}: attach failed for {path}: {e:#}"
+                                        );
+                                        AttachOutcome::Failed
+                                    }
+                                };
+                            }
                             return match self.scans.submit(path, file, scan_mode(kind)) {
                                 Ok(()) => AttachOutcome::Deferred,
                                 Err(SubmitError::QueueFull) => AttachOutcome::ScanQueueFull,
@@ -1516,6 +1608,70 @@ pub(super) fn scan_static_ssl_executable_paced(
     }
 }
 
+/// Maximum distance between SSL_read and SSL_write in the same compilation unit.
+const ADJACENCY_THRESHOLD: usize = 0x1000; // 4KB
+
+/// Resolve the Bun 2026 BoringSSL generation (Claude Code >= 2.1.315, #9762).
+///
+/// That rebuild re-emitted the `SSL_read` / `SSL_do_handshake` prologues and
+/// reordered `ssl_lib.cc` so `SSL_write` now *precedes* `SSL_read`. The legacy
+/// path assumes the old prologues and a write-after-read layout, so it cannot
+/// see this generation. Here the prologues are unique per build and `SSL_write`
+/// may sit on either side of `SSL_read` within [`ADJACENCY_THRESHOLD`]; the
+/// handshake follows the read, so the nearest match wins.
+fn resolve_bun2_ssl_offsets(
+    path: &str,
+    read_matches: &[usize],
+    handshake_matches: &[usize],
+    write_matches: &[usize],
+    verbose: bool,
+) -> StaticSslScan {
+    let [read_off] = read_matches else {
+        if verbose {
+            eprintln!(
+                "Static SSL: Bun2 SSL_read pattern has {} matches, expected 1 in {path}",
+                read_matches.len()
+            );
+        }
+        return StaticSslScan::NoOffsets;
+    };
+    let read_off = *read_off;
+    let Some(&hs_off) = handshake_matches
+        .iter()
+        .min_by_key(|&&o| o.abs_diff(read_off))
+    else {
+        if verbose {
+            eprintln!("Static SSL: Bun2 SSL_do_handshake pattern not found in {path}");
+        }
+        return StaticSslScan::NoOffsets;
+    };
+    let Some(&wr_off) = write_matches
+        .iter()
+        .filter(|&&o| o.abs_diff(read_off) < ADJACENCY_THRESHOLD)
+        .min_by_key(|&&o| o.abs_diff(read_off))
+    else {
+        if verbose {
+            eprintln!(
+                "Static SSL: Bun2 SSL_write has {} matches but none within {}B of SSL_read ({read_off:#x})",
+                write_matches.len(),
+                ADJACENCY_THRESHOLD
+            );
+        }
+        return StaticSslScan::NoOffsets;
+    };
+    log::debug!("Static SSL (Bun2) detected in {path}:");
+    log::debug!("  SSL_do_handshake: {hs_off:#x}");
+    log::debug!("  SSL_read:         {read_off:#x}");
+    log::debug!("  SSL_write:        {wr_off:#x}");
+    StaticSslScan::Offsets(StaticSslOffsets {
+        ssl_write: wr_off,
+        ssl_read: read_off,
+        ssl_do_handshake: hs_off,
+        write_is_ex: false,
+        read_is_ex: false,
+    })
+}
+
 fn find_static_ssl_offsets_with(
     path: &str,
     mut scan: impl FnMut(&str, &[&[u8]]) -> Option<Vec<Vec<usize>>>,
@@ -1545,8 +1701,18 @@ fn find_static_ssl_offsets_with(
         0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83,
         0xec, 0x18, 0x41, 0x89, 0xd7, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb,
     ];
-    // Maximum distance between SSL_read and SSL_write in the same compilation unit.
-    const ADJACENCY_THRESHOLD: usize = 0x1000; // 4KB
+    // Bun's 2026 BoringSSL rebuild (Claude Code >= 2.1.315): SSL_read saves r12
+    // instead of rax and branches with a near jne; SSL_do_handshake shrinks to a
+    // two-register save. SSL_write keeps WRITE_PAT. Verified unique per build and
+    // absent from every earlier generation (#9762).
+    const READ_PAT_BUN2: &[u8] = &[
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xbf, 0x98,
+        0x00, 0x00, 0x00, 0x00, 0x0f, 0x85,
+    ];
+    const HANDSHAKE_PAT_BUN2: &[u8] = &[
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x47, 0x30, 0xc7,
+        0x80, 0xc4, 0x00, 0x00, 0x00, 0x00,
+    ];
     let verbose = config::verbose();
 
     // One streaming pass collects every pattern at once: the file is read in
@@ -1554,22 +1720,31 @@ fn find_static_ssl_offsets_with(
     // instead of its own size.
     let mut patterns: Vec<&[u8]> = vec![READ_PAT, WRITE_PAT];
     patterns.extend_from_slice(HANDSHAKE_PATS);
+    patterns.push(READ_PAT_BUN2);
+    patterns.push(HANDSHAKE_PAT_BUN2);
     let mut hits = match scan(path, &patterns) {
         Some(hits) => hits,
         None => return StaticSslScan::Failed,
     };
     // Drain the fixed slots high-index-first so the remaining vectors are
-    // exactly the handshake variants.
+    // exactly the legacy handshake variants.
+    let handshake_bun2 = hits.remove(5);
+    let read_bun2 = hits.remove(4);
     let write_matches = hits.remove(1);
     let read_matches = hits.remove(0);
     let handshake_hits = hits;
 
     // --- SSL_read: expect unique match ---
     if read_matches.is_empty() {
-        if verbose {
-            eprintln!("Static SSL: SSL_read pattern not found in {path}");
-        }
-        return StaticSslScan::NoOffsets;
+        // No legacy SSL_read prologue: try the Bun 2026 generation before giving
+        // up, so a reordered ssl_lib.cc still resolves (#9762).
+        return resolve_bun2_ssl_offsets(
+            path,
+            &read_bun2,
+            &handshake_bun2,
+            &write_matches,
+            verbose,
+        );
     }
     let read_off = if read_matches.len() == 1 {
         read_matches[0]
@@ -2402,7 +2577,7 @@ fn attach_cosh_tap(skel: &mut SslsniffSkel<'_>, lib: &str, pid: i32) -> Result<V
 
 // ─── Codex offset table (Tier 3) ────────────────────────────────────────────
 
-use super::codex_offsets::OffsetTable;
+use super::codex_offsets::{LearnedOffsets, OffsetTable};
 
 static CODEX_OFFSET_TABLE: std::sync::LazyLock<Option<OffsetTable>> =
     std::sync::LazyLock::new(|| {
@@ -2635,6 +2810,24 @@ mod tests {
         0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83,
         0xec, 0x18, 0x41, 0x89, 0xd7, 0x49, 0x89, 0xf6, 0x48, 0x89, 0xfb,
     ];
+    const READ_BUN2_PAT: &[u8] = &[
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xbf, 0x98,
+        0x00, 0x00, 0x00, 0x00, 0x0f, 0x85,
+    ];
+    const HS_BUN2_PAT: &[u8] = &[
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x47, 0x30, 0xc7,
+        0x80, 0xc4, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Zero-filled image for the Bun 2026 generation: SSL_write precedes
+    /// SSL_read and the handshake follows it (the reordered ssl_lib.cc layout).
+    fn build_bun2_ssl_image(write: usize, read: usize, hs: usize) -> Vec<u8> {
+        let mut img = vec![0u8; 0x5000];
+        img[write..write + WRITE_PAT_T.len()].copy_from_slice(WRITE_PAT_T);
+        img[read..read + READ_BUN2_PAT.len()].copy_from_slice(READ_BUN2_PAT);
+        img[hs..hs + HS_BUN2_PAT.len()].copy_from_slice(HS_BUN2_PAT);
+        img
+    }
 
     /// Zero-filled synthetic binary with the given prologues planted at file
     /// offsets; zeros cannot match any pattern, so matches are unambiguous.
@@ -2729,6 +2922,181 @@ mod tests {
                 Some(ExecutableScan::NoMarkers)
             ));
         });
+    }
+
+    fn fixture_file_key(path: &Path) -> FileKey {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).expect("stat fixture");
+        (stat_dev_to_key(meta.dev()), meta.ino())
+    }
+
+    /// Serializes tests that republish the process-wide learned-cache path.
+    static LEARNED_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build an `SslSniff` whose learned-offset cache points at a per-test
+    /// temp directory. The caller must hold [`LEARNED_PATH_LOCK`]: the path
+    /// is process-global and read at construction time.
+    fn sniffer_with_isolated_learned_cache(
+        _guard: &std::sync::MutexGuard<'_, ()>,
+        dir: &tempfile::TempDir,
+    ) -> SslSniff {
+        crate::config::set_ssl_offsets_learned_path(dir.path().join("learned.json"));
+        SslSniff::new().expect("sslsniff BPF should load on this kernel")
+    }
+
+    /// Regression for #9762: one drain tick must install every completed scan,
+    /// not a fixed quota. The result channel is bounded and the single worker
+    /// blocks on send once it fills; a per-tick quota let results pile up under
+    /// process churn and stalled the worker. Reverting to a quota below the
+    /// fixture count makes this test fail.
+    #[test]
+    #[ignore] // constructs SslSniff: requires CAP_BPF + CAP_PERFMON (root)
+    fn scan_drain_installs_all_completed_results_in_one_tick() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: uprobe attach requires root");
+            return;
+        }
+        let guard = LEARNED_PATH_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let learned_dir = tempfile::tempdir().unwrap();
+        let mut sniffer = sniffer_with_isolated_learned_cache(&guard, &learned_dir);
+        let owner = std::process::id();
+        let image = build_static_ssl_image(Some((0x100, HS_BUN_PAT)), Some(0x2000), Some(0x2100));
+        // More fixtures than the historical per-tick quota of four.
+        let fixtures: Vec<_> = (0..6)
+            .map(|_| {
+                let file = tempfile::NamedTempFile::new().expect("fixture");
+                fs::write(file.path(), &image).expect("write fixture");
+                file
+            })
+            .collect();
+        let mut keys = Vec::new();
+        for file in &fixtures {
+            let key = fixture_file_key(file.path());
+            sniffer.traced_files.insert(key);
+            sniffer
+                .scans
+                .submit(file.path().to_str().unwrap(), key, ScanMode::KnownStatic)
+                .expect("submit scan");
+            keys.push(key);
+        }
+        sniffer.pid_inodes.insert(owner, keys);
+        // The worker scans 20 KiB fixtures in milliseconds; wait generously so
+        // every result is queued before the single drain tick under test.
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = sniffer.poll_pending_scan_admissions();
+        assert_eq!(
+            sniffer.attachments.len(),
+            fixtures.len(),
+            "one tick must install every completed scan"
+        );
+    }
+
+    /// Regression for #9762: when the originating process exits before its
+    /// scan result is installed, the verified offsets are inode-global and
+    /// must still be cached and attached, so the next process mapping the
+    /// binary is captured without re-racing the scan. Reverting to the
+    /// ownerless discard makes this test fail.
+    #[test]
+    #[ignore] // constructs SslSniff: requires CAP_BPF + CAP_PERFMON (root)
+    fn exited_owner_offsets_are_installed_and_cached() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: uprobe attach requires root");
+            return;
+        }
+        let guard = LEARNED_PATH_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let learned_dir = tempfile::tempdir().unwrap();
+        let mut sniffer = sniffer_with_isolated_learned_cache(&guard, &learned_dir);
+        let owner = std::process::id();
+        let image = build_static_ssl_image(Some((0x100, HS_BUN_PAT)), Some(0x2000), Some(0x2100));
+        let file = tempfile::NamedTempFile::new().expect("fixture");
+        fs::write(file.path(), &image).expect("write fixture");
+        let path = file.path().to_str().unwrap().to_owned();
+        let key = fixture_file_key(file.path());
+        sniffer.traced_files.insert(key);
+        sniffer
+            .scans
+            .submit(&path, key, ScanMode::KnownStatic)
+            .expect("submit scan");
+        sniffer.pid_inodes.insert(owner, vec![key]);
+        // The owner exits while the scan is still in flight.
+        sniffer.detach_process(owner);
+        std::thread::sleep(Duration::from_secs(1));
+        let admitted = sniffer.poll_pending_scan_admissions();
+        assert!(admitted.is_empty(), "no live owner remains to admit");
+        assert!(
+            sniffer.attachments.contains_key(&key),
+            "ownerless result must still install the global uprobe"
+        );
+        assert!(
+            sniffer.static_attach_offsets.contains_key(&key),
+            "verified offsets must stay cached for the next process"
+        );
+        assert!(sniffer.traced_files.contains(&key));
+        // The next process attaching this inode must reuse the cached offsets
+        // instead of queueing another whole-binary scan.
+        let outcome = sniffer.build_attach(owner as i32, key, &path, SslLibKind::Static, &path);
+        assert!(
+            matches!(outcome, AttachOutcome::Attached(_)),
+            "cached offsets must attach without a re-scan"
+        );
+        assert!(!sniffer.scans.is_pending(key), "no re-scan may be queued");
+    }
+
+    /// Regression for #9762: offsets learned in one service lifetime must
+    /// make the next lifetime attach synchronously at discovery — a warm
+    /// agent's first TLS call completes long before an asynchronous
+    /// whole-binary scan would install. Reverting the learned cache (or its
+    /// persistence) makes this test fail.
+    #[test]
+    #[ignore] // constructs SslSniff: requires CAP_BPF + CAP_PERFMON (root)
+    fn learned_offsets_survive_restart_and_attach_synchronously() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: uprobe attach requires root");
+            return;
+        }
+        let guard = LEARNED_PATH_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let learned_dir = tempfile::tempdir().unwrap();
+        let image = build_static_ssl_image(Some((0x100, HS_BUN_PAT)), Some(0x2000), Some(0x2100));
+        let file = tempfile::NamedTempFile::new().expect("fixture");
+        fs::write(file.path(), &image).expect("write fixture");
+        let path = file.path().to_str().unwrap().to_owned();
+        let key = fixture_file_key(file.path());
+        let owner = std::process::id();
+
+        {
+            let mut sniffer = sniffer_with_isolated_learned_cache(&guard, &learned_dir);
+            sniffer.traced_files.insert(key);
+            sniffer
+                .scans
+                .submit(&path, key, ScanMode::KnownStatic)
+                .expect("submit scan");
+            sniffer.pid_inodes.insert(owner, vec![key]);
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = sniffer.poll_pending_scan_admissions();
+            assert!(
+                sniffer.attachments.contains_key(&key),
+                "first lifetime must install the scanned offsets"
+            );
+        } // Dropping the sniffer detaches its links, simulating a service stop.
+
+        // "Restart": a fresh instance must attach from the persisted cache
+        // without queueing another whole-binary scan.
+        let mut restarted = sniffer_with_isolated_learned_cache(&guard, &learned_dir);
+        let outcome = restarted.build_attach(owner as i32, key, &path, SslLibKind::Static, &path);
+        assert!(
+            matches!(outcome, AttachOutcome::Attached(_)),
+            "learned cache must attach synchronously after a restart"
+        );
+        assert!(
+            !restarted.scans.is_pending(key),
+            "a cache hit must not queue another whole-binary scan"
+        );
     }
 
     #[test]
@@ -2878,6 +3246,60 @@ mod tests {
             assert_eq!(off.ssl_read, 0x2000);
             assert_eq!(off.ssl_write, 0x2100);
         });
+    }
+
+    #[test]
+    fn static_ssl_offsets_matches_bun2_generation() {
+        // Regression for Claude Code >= 2.1.315 (#9762): the 2026 Bun rebuild
+        // changed the read/handshake prologues and put SSL_write before SSL_read.
+        // Offsets mirror the real 2.1.319 layout (write 0x1a0 before read,
+        // handshake 0x470 after), validated with kernel uprobes on live TLS.
+        let img = build_bun2_ssl_image(0x2000, 0x21a0, 0x2610);
+        with_static_ssl_fixture("bun2", &img, |path| {
+            let off = find_static_ssl_offsets(path).expect("Bun2 generation must be detected");
+            assert_eq!(off.ssl_write, 0x2000);
+            assert_eq!(off.ssl_read, 0x21a0);
+            assert_eq!(off.ssl_do_handshake, 0x2610);
+            assert!(!off.write_is_ex && !off.read_is_ex);
+        });
+    }
+
+    #[test]
+    fn static_ssl_offsets_bun2_rejects_write_beyond_adjacency() {
+        // SSL_write must sit within ADJACENCY_THRESHOLD of SSL_read on either
+        // side; a distant write must not resolve.
+        let img = build_bun2_ssl_image(0x4000, 0x2000, 0x2100);
+        with_static_ssl_fixture("bun2-write-far", &img, |path| {
+            assert!(find_static_ssl_offsets(path).is_none());
+        });
+    }
+
+    #[test]
+    fn static_ssl_offsets_bun2_requires_handshake() {
+        // Read + write present but no handshake prologue: must not resolve.
+        let mut img = vec![0u8; 0x5000];
+        img[0x2000..0x2000 + WRITE_PAT_T.len()].copy_from_slice(WRITE_PAT_T);
+        img[0x21a0..0x21a0 + READ_BUN2_PAT.len()].copy_from_slice(READ_BUN2_PAT);
+        with_static_ssl_fixture("bun2-no-hs", &img, |path| {
+            assert!(find_static_ssl_offsets(path).is_none());
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a real Claude Code binary: AGENTSIGHT_CLAUDE_BIN=/path/claude cargo test --lib real_claude_binary_resolves -- --ignored --nocapture"]
+    fn real_claude_binary_resolves() {
+        // Maintainer aid for the next Bun rebuild: point this at a real
+        // claude.exe and confirm the detector still resolves all three offsets,
+        // then validate them with kernel uprobes on live TLS traffic (#9762).
+        let Ok(path) = std::env::var("AGENTSIGHT_CLAUDE_BIN") else {
+            eprintln!("set AGENTSIGHT_CLAUDE_BIN to a claude.exe to run this check");
+            return;
+        };
+        let off = find_static_ssl_offsets(&path).expect("real Claude binary must resolve");
+        eprintln!(
+            "resolved {}: write={:#x} read={:#x} handshake={:#x}",
+            path, off.ssl_write, off.ssl_read, off.ssl_do_handshake
+        );
     }
 
     #[test]

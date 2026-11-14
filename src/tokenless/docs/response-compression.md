@@ -2,7 +2,9 @@
 
 ## 一、功能概述
 
-PostTool 压缩由 Runtime 内部的 `PostToolPipeline` 编排，并按内容类型与内容来源静态派发给六个领域之一：JSON、Build Log、Tabular、Search Results 路径共享与 HTML 页面转写默认启用；Diff 上下文裁剪也默认启用，可通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED=0` 关闭。JSON 压缩器只解析一次输入，先生成保留全部字段、空值和数组元素的 Compact JSON/TOON 候选。HTML 转写开启、来源不是 `file_read` 且 Stash 与恢复路径可用时，再生成把字符串值中的 HTML 就地转写为 Markdown 的嵌入内容候选（见下文“JSON 值中的嵌入内容”），整体更小时取代前者。两者中较优的无损候选同时减少字符与估算 Token 且 Token 节省率达到 15% 时直接采用。否则再生成包含 Record Reduction 或既有截断规则的 Bounded 候选，并选择更小的合法表示。Build Log 压缩器处理成功的 `command_output` 或 `file_read`，沿用 SGR 颜色清理，对已识别 pnpm 日志进行无需恢复的布局压紧，并对构建、测试和包安装日志中的常规进度进行可恢复缩减。Tabular 压缩器生成保留单元格或可恢复选取整行的 CSV/TSV 视图；Search Results 压缩器在连续行之间共享重复路径，不丢弃任何命中；Diff 裁剪只删减未修改的上下文行，元信息与改动行原样保留；HTML 转写选取 `<main>`、`role=main` 或唯一的最外层 `<article>` 作为主内容根（都不存在时为 `<body>`），只渲染该根并移除其中可枚举的非内容元素，根外节点计数后省略。这两个领域都把原文写入 Stash，只有恢复路径可用时才会执行，结果可通过 Retrieve 找回。Tool Error 保留原始输出并只追加环境诊断；`file_content` 来源与其他内容类型透传。
+PostTool 压缩由 Runtime 内部的 `PostToolPipeline` 编排，并按内容类型与内容来源静态派发给六个领域之一：JSON、Build Log、Tabular、Search Results 路径共享与 HTML 页面转写默认启用；Diff 上下文裁剪也默认启用，可通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED=0` 关闭。JSON 压缩器只解析一次输入，先生成保留全部字段、空值和数组元素的 Compact JSON/TOON 候选。HTML 转写开启、来源不是 `file_read` 且 Stash 与恢复路径可用时，再生成把字符串值中的 HTML 就地转写为 Markdown 的嵌入内容候选（见下文“JSON 值中的嵌入内容”），整体更小时取代前者。两者中较优的无损候选同时减少字符与估算 Token 且 Token 节省率达到 15% 时直接采用。否则再生成包含 Record Reduction 或既有截断规则的 Bounded 候选，并选择更小的合法表示。Build Log 压缩器处理成功的 `command_output` 或 `file_read`，沿用 SGR 颜色清理，对已识别 pnpm 日志进行无需恢复的布局压紧，并对构建、测试和包安装日志中的常规进度进行可恢复缩减。Tabular 压缩器生成保留单元格或可恢复选取整行的 CSV/TSV 视图；Search Results 压缩器在连续行之间共享重复路径，不丢弃任何命中；Diff 裁剪只删减未修改的上下文行，元信息与改动行原样保留；HTML 转写选取 `<main>`、`role=main` 或唯一的最外层 `<article>` 作为主内容根（都不存在时为 `<body>`），只渲染该根并移除其中可枚举的非内容元素，根外节点计数后省略。这两个领域都把原文写入 Stash，只有恢复路径可用时才会执行，结果可通过 Retrieve 找回。Tool Error 保留原始输出并只追加环境诊断；`file_content` 来源与其他内容类型透传。此外还有一个默认关闭的 Mixed Content 领域：整内容
+候选全部未命中时，按显式定界的 typed region 逐段压缩混合输出（见「三、递归处理顺序」
+之后的「Mixed Content 领域」一节）。
 
 ## 二、压缩规则与保留约定
 
@@ -116,6 +118,36 @@ HTML 等文件来源保护；命令匹配可防止重试失效操作失败时误
 缩减的宿主可能暂时原样接收这些命令的输出。`pnpm install` 不在本轮新增原生命令豁免范围，
 仍可能被 RTK 改写；pnpm 能力只处理按既有归属规则实际进入 PostTool 的原始内容。
 
+### Mixed Content 领域（默认关闭）
+
+通过 `TOKENLESS_MIXED_CONTENT_ENABLED` 显式开启。开启后，当一段工具输出既不是完整的
+结构化文档、也不是任何整内容候选（JSON、Build Log、Tabular、Search Results、Diff、HTML）
+能处理时，Pipeline 把它按 **typed region** 拆分处理：识别输出中显式定界的结构化片段并逐段
+压缩，周围的 prose、日志与分隔符逐字节保留。该路由只做结构性识别，不需要宿主提供任何
+语义提示，也不会从受保护的代码块中提取内容。
+
+识别的 region 类型（边界必须显式可验证）：
+
+- **Fenced code block**（``` 或 ~~~，缩进不超过 3 个空格，闭合 fence 同标记且长度不小于
+  开 fence）：info string 首词决定领域——`json` 走 JSON 压缩器，`csv`/`tsv` 走 Tabular
+  压缩器。未闭合的 fence 保护其余全部输出；info string 含反引号的反引号 fence 不构成
+  fence；未知标签（`python`、`rust` 等）的块整体受保护，其中的内容不参与识别。
+- **裸 JSON 文档**：行首（缩进不超过 3 空格）以 `{` 或 `[` 开始且括号平衡（字符串内的
+  括号、转义引号均正确处理）的完整文档。裸 CSV/TSV 没有可验证边界，不识别。
+
+每个 region 独立交给对应领域的压缩器，使用与整内容路由完全相同的配置和策略：
+压缩失败、区域无节省或压缩器拒绝时，该区域逐字节保留；某个 fenced JSON 区域选择了 TOON
+时，仅其 info word 改写为 `toon`，其余属性保留原文与顺序，保持表示元数据与实际变换
+一致。整个候选仍需通过 Pipeline 的全局字符/Token 仲裁与 savings 门禁；没有任何区域
+发生变化、未产生暂存 Stash 写入且没有 Stash 错误时直接透传；携带暂存写入的未变化候选
+进入 NoSavings 处置，让 ledger 回滚暂存行。任一区域写入 Stash 失败时，整个候选被拒绝，
+ledger 回滚本次请求的全部暂存写入，包括其他区域成功的写入，再由 Runtime 报告存储错误。
+区域识别只覆盖与
+其他领域相同的 64 KiB / 200 行检测窗口，开在窗口之外的区域逐字节保留。区域压缩产生的
+Stash 写入与可恢复性按各区域结果合并，取最弱可恢复性。
+`protect_search_output` 为真的请求（Grep 工具输出与已识别的 Shell `grep`/`rg` 命令输出）
+不进入该路由，关闭搜索路径共享也不例外；`replace_with_text` 为假的请求同样不进入。
+
 ## 四、集成路径
 
 ### 路径 1：OpenClaw 插件（实时工具结果 middleware）
@@ -199,33 +231,45 @@ Hook 校验版本与 Operation，并按宿主 Capability 应用 v2 Result
 | `html` | 来源不是 `file_read`，宿主支持文本替换，Stash 与恢复路径可用 | `HtmlExtractor`：只渲染主内容根（`<main>`、`role=main`、唯一的最外层 `<article>` 或 body），移除可枚举非内容元素（含表单控件、媒体嵌入、dialog）后转写为 Markdown，根外节点计数省略，嵌套超过 512 层不解析 | 启用，`TOKENLESS_HTML_EXTRACTION_ENABLED=false` 关闭 |
 
 **JSON 值中的嵌入内容**：`json/embedded.rs` 按节点路由字符串值，判断只看值本身，不看字段
-名。目前识别的唯一内容域是 HTML：值至少 256 个字符，以 HTML 词表中的标签、注释或
-`<!doctype html` 开头并以 `>` 结尾时，交给 `HtmlExtractor` 的片段模式。片段模式渲染整个
-body，不选择主内容根，只移除样式与注释；元素超出词表（表单字段、脚本、媒体、框架、页面框架
-元素、`link`、`del`/`sup`/`time` 等）、元素带 `hidden`、行内样式或 `<style>` 中出现外观白
-名单（`html/fragment/css.rs`）之外的声明（删除线、上下标位移、隐藏或生成内容、列表标记、保
-留换行、符号字体、负间距、文字可能溢出的固定宽高、可能盖住相邻行的行内上下内边距与边框或装
-饰线粗细、过宽的字间距，以及转义、厂商前缀、自定义属性和颜色、图片以外的 `calc()`、`var()`
-等函数这类无法判读的写法）、文字在屏幕上难以看清（`html/fragment/legibility.rs` 沿行内样
-式、表现属性、`<style>` 和浏览器默认样式推算每段文字的颜色、背景、字号与行高：与可能所处背
-景的对比度低于 1.5、位于背景图片或渐变之上、字号小于 6px 或行距小于字号一半；样式表规则和
-表格列背景视为可作用于任意元素，页面按白底 16px 黑字处理；每对文字与背景颜色只比较一次，超
-过 65,536 次不同比较时拒绝）、属性超出白名单（`data-*`、`aria-*` 标签与状态、链接和图片以
-外的 `title`、`th` 的 `abbr`、`cite` 等视图无法呈现的值；含文字的 `aria-hidden`；描述、跳
-转等 `meta`）、折叠 `details` 中的正文、有序列表编号无法复现（`start` 不是普通非负整数、空
-列表项或列表项之间的内容会让编号与浏览器不一致）、顶部以外还有整行表头、结构被压平（单元格
-内嵌套表格或换行、超深嵌套），或任何文字节点与链接、图片目标（含作为 Markdown 标题输出的
-`title`）未按浏览器绘制顺序出现在视图中时拒绝，原值保留。表格的第一个 `thead` 与 `tfoot`
-按浏览器位置分别输出在最前和最后，页面模式同样如此。源中以空白、`br`、块级元素、表格单元或
-按钮分开的相邻文字，视图中也必须以空白分开，因此任何渲染路径把 `a<br>b` 拼成 `ab` 都会被拒
-绝；`pre` 与行内代码中的 `br` 和块级元素按换行渲染。每个改写值在 JSON 转义形式下（含首行与
-恢复指令）须至少节省 16 个估算 Token，先用占位 Key 测量，通过后才写入 Stash；同一值只渲
-染、写入一次，各候选共享结果。改写值替换原字符串，字段名、类型、数字字面量和记录关联不变，
-原值可通过该值中的恢复指令逐字节取回。工作量按文档限定：值不超过 256 KiB、深度不超过 32、
-最多解析 128 个值和 2 MiB。Bounded 候选中视图超过字符串上限的值改为普通截断。所有候选的
-Stash 写入按发生顺序交给 Runtime Ledger，未出现在最终输出中的写入在 Commit 时删除，拒绝时
-回滚。响应操作为 `html_extraction`，内容类型为 `json`。新增内容域时扩展 `EmbeddedKind` 并
-复用相应领域压缩器，不新增路由流水线。
+名。目前识别的唯一内容域是 HTML：值至少 256 个字符，以受支持的 HTML5 或 SVG 标签、注释或
+`<!doctype html` 开头并以 `>` 结尾时，交给 `HtmlExtractor` 的片段模式。片段模式与页面模式
+共用同一 `Renderer`，通过 `FragmentPlan`（`html/fragment/plan.rs`）对整段 HTML 做四分类规
+划，不选择主内容根，只移除纯外观 `<style>` 与注释并在首行计数：富文本子树转写为
+Markdown；携带 `data-*`、`aria-*`、非表现性 `role`、`cite`、被引用 `id` 的容器及 `nav`、
+`header`、`footer`、`aside` 等框架容器保留外层 HTML 起止标签（`Shell`）并递归压缩内部富文
+本；无法用 GFM 表达的表格与编号或状态会漂移的列表在含可压缩富文本时保留成套 HTML 表格/列
+表壳，否则原样保留（非结构型 `Shell` 在起止标签与内部正文之间插入空行以结束 CommonMark
+type-6 HTML block，使下游渲染器能继续解析壳内 Markdown；`table`/`tbody`/`tr`、`ul`/`ol`、
+`dl` 等结构型 `Shell` 用单个 `\n` 连接子节点以维持父子标签结构，壳内 Markdown 解析依赖各
+非原样保留的单元格或列表项自身提供空行边界，直接落入结构型壳内的行内子节点仍处于 HTML
+block 中）；`<svg>`（保留 `xlink:href` 等前缀属性，去除根上纯外观 `style`/`class` 与纯外
+观 `<style>`）、
+合法 JSON 数据块（不带 `src` 的 `<script type="application/json">` 与
+`application/ld+json`）、表单控件与状态、`del`/`ins`/`s`/`sub`/`sup`/`time`/`data`、行内
+`line-through`/`sub`/`super`/`white-space`、不含函数调用的 `list-style`、含文字的
+`aria-hidden` 及 `javascript:`/`data:`
+链接和图片作为紧凑 HTML 原地保留（`Verbatim`）。全局风险——可执行或外部 `<script>`、行内 `on*` 事件属性、`javascript:`/`data:` 表单提交
+地址、`<template>`、`iframe`/`object`/`embed`、MathML、未知或自定义元素、`<base>`、`<link>`、非
+纯外观 `<meta>`、折叠或分组 `details`、`hidden` 属性、HTML 或 SVG `<style>` 中超出纯外观白
+名单的规则、带 `url()` 等函数的 `list-style*`、零尺寸隐藏替换图片、
+非零 `order`、`flex-basis: 0` 裁切、符号字体、负或过宽字间距、无法判读的转义/厂商前缀/自定
+义属性/`var()`，或文字在屏幕上难以看清（`html/fragment/legibility.rs` 沿行内样式、表现属
+性、`<style>` 和浏览器默认样式推算每段可见文字的颜色、背景、字号与行高，跳过 `<script>`、
+`<style>` 及 SVG 定义/元数据节点，并为表单控件补充 UA 白底黑字默认值；对比度低于 1.5、位于
+背景图片或渐变之上、字号小于 6px、行距小于字号一半、文字可能溢出的固定宽高、超过 8px 的行
+内上下内边距/边框或设粗细的装饰线，或超过 65,536 次不同颜色对比较时拒绝），以及无任何子树
+转换为 Markdown，或任何可见文字、保留标签与链接/图片目标未按源码顺序和分词边界出现在视图中
+时，整值原样保留。表格的第一个 `thead` 与 `tfoot` 按浏览器位置分别输出在最前和最后，页面模
+式同样如此。源中以空白、`br`、块级元素、表格单元、按钮或 flex/`inline-block` 子项分开的相邻
+文字，视图中也必须以空白分开，因此任何渲染路径把 `a<br>b` 拼成 `ab` 都会被拒绝；`pre` 与行
+内代码中的 `br` 和块级元素按换行渲染。每个改写值在 JSON 转义形式下（含首行与恢复指令）须至
+少节省 16 个估算 Token，先用占位 Key 测量，通过后才写入 Stash；同一值只渲染、写入一次，各候
+选共享结果。改写值替换原字符串，字段名、类型、数字字面量和记录关联不变，原值可通过该值中的
+恢复指令逐字节取回。工作量按文档限定：值不超过 256 KiB、深度不超过 32、最多解析 128 个值和
+2 MiB。Bounded 候选中视图超过字符串上限的值改为普通截断。所有候选的 Stash 写入按发生顺序交
+给 Runtime Ledger，未出现在最终输出中的写入在 Commit 时删除，拒绝时回滚。响应操作为
+`html_extraction`，内容类型为 `json`。新增内容域时扩展 `EmbeddedKind` 并复用相应领域压缩
+器，不新增路由流水线。
 
 Diff 与 HTML 领域要求至少节省 16 个 Token 才采用结果，其他领域至少 1 个。Diff 与 HTML
 没有可用 Stash 或宿主未声明恢复能力（例如裸 `tokenless` 不在 Shell `PATH` 中）时，即使已开启
@@ -288,7 +332,7 @@ Hermes Adapter 不再持有 200 字符门禁、JSON 检测、截断阈值、TOON
 
 Qoder 通过原生插件目录 `hooks/hooks.json` 加载 hook，并在运行时展开 `${QODER_PLUGIN_ROOT}`。插件内的 `hooks/run-hook.sh` 再从 ANOLISA adapter 目录定位共享的 `compress_response_hook.py`，无需改写 `~/.qoder/settings.json` 或将机器相关绝对路径写入插件缓存。
 
-Qoder CLI 支持对任意工具使用 `hookSpecificOutput.updatedToolOutput`，因此压缩结果会**替换**原始工具输出，`additionalContext` 只携带环境错误归因等追加信息。原生 Bash 只把字符串 `stdout` 交给 Core，包括较短或为空的值；压缩后回填到原对象，`stderr` 和其他字段保持不变。其他结果形态沿用 JSON 字符串返回。Bash 对象的其他字段保持原值，由 Qoder 决定其模型可见的渲染方式；字符串响应可使用更小的 TOON 文本。Marker 中的 `tokenless retrieve` 命令可以通过已有 Shell Tool 执行，成功结果原样旁路。其他不支持输出替换的 agent 才使用 `additionalContext` 回退。
+Qoder CLI 支持对任意工具使用 `hookSpecificOutput.updatedToolOutput`，因此压缩结果会**替换**原始工具输出，`additionalContext` 只携带环境错误归因等追加信息。原生 Bash 只允许替换字符串 `stdout`，包括较短或为空的值；压缩后回填到原对象，`stderr` 和其他字段保持不变。`stdout` 缺失或不是字符串时不替换原结果，错误诊断仍可读取 `stderr`。其他可替换的结构化结果沿用 JSON 字符串返回。Bash 对象的其他字段保持原值，由 Qoder 决定其模型可见的渲染方式；字符串响应可使用更小的 TOON 文本。Marker 中的 `tokenless retrieve` 命令可以通过已有 Shell Tool 执行，成功结果原样旁路。其他不支持输出替换的 agent 才使用 `additionalContext` 回退。
 
 这也意味着原生 Bash 对象中的独立 `stderr` 字段不再压缩或生成检索标记；Hook 返回 `{}`
 表示不替换工具结果，不表示给模型返回空文本。Qoder 1.1.78 的真实 Bash 探针中，进程的
@@ -534,6 +578,7 @@ Rust 调用方应移除 `JsonCompressionConfig.drop_nulls`、`drop_empty_fields`
 | Search Results 领域压缩器（SearchResultsCompressor） | `crates/tokenless-compressors/src/search_results.rs` |
 | HTML 领域转写器（HtmlExtractor） | `crates/tokenless-compressors/src/html.rs` |
 | Diff 上下文裁剪 | `crates/tokenless-runtime/src/post_tool/diff.rs` |
+| Mixed Content typed-region 识别与重建 | `crates/tokenless-runtime/src/post_tool/mixed.rs` |
 | PostTool Pipeline 与最终仲裁 | `crates/tokenless-runtime/src/post_tool/` |
 | Schema 压缩器（SchemaCompressor） | `crates/tokenless-schema/src/schema_compressor.rs` |
 | 内容压缩公开 API | `crates/tokenless-compressors/src/lib.rs` |

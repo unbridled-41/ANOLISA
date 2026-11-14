@@ -3,6 +3,7 @@
 from argparse import Namespace
 from collections import Counter
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import json
 import math
 import os
@@ -112,6 +113,19 @@ def main() -> None:
     executing = 0
     reload_restore = None
     reload_runtime = None
+    gateway_restore = None
+    primed_sessions: set[str] = set()
+
+    def record_session(session_id: str) -> None:
+        primed_sessions.add(session_id)
+        path = Path(launch_path).with_name("hermes-sessions.json")
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w") as record:
+            os.chmod(temporary, 0o600)
+            json.dump(sorted(primed_sessions), record)
+            record.flush()
+            os.fsync(record.fileno())
+        os.replace(temporary, path)
 
     def discovery(force: bool = False) -> None:
         if not force:
@@ -140,10 +154,16 @@ def main() -> None:
 
     def directives(*values: Any, **options: Any) -> plugins._PreToolCallDirective:
         with guarded_hooks():
-            details = original_directives(*values, **options)
-            # Native callbacks inspect the original arguments; their rewrites are
-            # merged only afterward. Reject rewrites rather than execute unchecked input.
-            if before and details.modified_args is not None:
+            cell = {}
+            token = session.rewritten_input.set(cell)
+            try:
+                details = original_directives(*values, **options)
+                checked = cell.get("input")
+            finally:
+                session.rewritten_input.reset(token)
+            # Only an AW response checked by every before policy may change input.
+            if (before and details.modified_args is not None and
+                    (checked is None or json.dumps(details.modified_args, sort_keys=True) != checked)):
                 return plugins._PreToolCallDirective(
                     action="block", message=details.message if details.action == "block" else
                     rewrite_error,
@@ -171,7 +191,7 @@ def main() -> None:
             return original_execution(tool_name, arguments, dispatch, **context)
 
     def prepare(args: Namespace) -> None:
-        nonlocal post_restore, skill_restore, dispatch_restore, input_restore, reload_restore, reload_runtime
+        nonlocal post_restore, skill_restore, dispatch_restore, input_restore, reload_restore, reload_runtime, gateway_restore
         admit_reload = None
         if env_var_enabled("HERMES_SAFE_MODE"):
             raise SystemExit("HERMES_SAFE_MODE disables the AW native plugin")
@@ -190,6 +210,31 @@ def main() -> None:
         if receipt != expected or env_var_enabled("HERMES_SAFE_MODE"):
             raise SystemExit("Hermes AW registration does not match this launch")
         require_hooks()
+        if launch["hooks"] and gateway_restore is None:
+            try:
+                from hermes_cli.gateway_agent import GatewayAgent
+            except ImportError:
+                pass  # Older in-process Hermes releases have no GatewayAgent.
+            else:
+                original_run = GatewayAgent.run_conversation
+
+                def bound_run(agent: Any, *args: Any, **kwargs: Any) -> Any:
+                    require_hooks()
+                    # A lost prime receipt still leaves a registration to reconcile.
+                    record_session(agent.session_id)
+                    receipt = agent.connection.call(
+                        "plugin.aw-native-hooks.prime", session_id=agent.session_id,
+                        launch_path=launch_path, token=launch["token"])
+                    if (not isinstance(receipt, dict) or receipt.get("adapter") != "hermes"
+                            or receipt.get("token") != launch["token"]
+                            or receipt.get("hooks") != len(launch["hooks"])
+                            or not isinstance(receipt.get("gateway_pid"), int)):
+                        raise RuntimeError("Hermes Gateway did not register the AW callbacks")
+                    print("AW hermes Gateway callbacks active", file=sys.stderr)
+                    return original_run(agent, *args, **kwargs)
+
+                gateway_restore = (GatewayAgent, original_run)
+                GatewayAgent.run_conversation = bound_run
         if launch.get("reloadable") and reload_restore is None:
             import cli
             from aw_reload import Runtime
@@ -279,6 +324,7 @@ def main() -> None:
     # Hermes reloads both plugin modules and dotenv during chat. Keep the binding
     # in this launcher's namespace, outside native plugin teardown and environment.
     session = ModuleType("_aw_hermes_session")
+    session.rewritten_input = ContextVar("aw_hermes_rewritten_input", default=None)
     session.launch_path = launch_path
     session.skills = skills
     sys.modules[session.__name__] = session
@@ -302,6 +348,8 @@ def main() -> None:
         manager.discover_and_load = original_discovery
         if reload_restore is not None:
             reload_restore[0].chat = reload_restore[1]
+        if gateway_restore is not None:
+            gateway_restore[0].run_conversation = gateway_restore[1]
         if input_restore is not None:
             cli, original_main, original_images = input_restore
             cli.main = original_main

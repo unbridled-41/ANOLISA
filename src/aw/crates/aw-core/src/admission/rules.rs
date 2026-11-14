@@ -145,6 +145,19 @@ pub fn preflight(
                 "result replacement must be the last applicable enabled event step",
             )?;
         }
+        for (index, step) in enabled.iter().enumerate() {
+            if step["effects"]
+                .as_array()
+                .is_some_and(|effects| effects.iter().any(|effect| effect == "replace_input"))
+                && effects.iter().any(|effect| effect == "replace_input")
+            {
+                require(
+                    index == 0 && step["effects"] == serde_json::json!(["replace_input"])
+                        && enabled.iter().all(|step| step["on_error"] == "block"),
+                    "input replacement requires a first sole-effect step and fail-closed before steps",
+                )?;
+            }
+        }
         for step in enabled {
             candidates.push(preflight_step(
                 spec,
@@ -199,8 +212,10 @@ fn preflight_step(
         }
         if protocol == aw_config::HOOK_PROTOCOL {
             require(
-                !effects.iter().any(|effect| effect == "replace_result"),
-                "boolean Hooks cannot replace results",
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect.as_str(), "replace_result" | "replace_input")),
+                "boolean Hooks cannot replace input or results",
             )?;
             StepExecution::Hook {
                 effects,
@@ -216,7 +231,7 @@ fn preflight_step(
     let on_error = string(&step["on_error"])?;
     require(
         on_error == "report"
-            || (matches!(event, "input.submit" | "tool.before")
+            || (matches!(event, "input.submit" | "tool.before" | "security.violation")
                 && on_error == "block"
                 && adapter_effects.iter().any(|effect| effect == "block"))
             || (event == "tool.after"
@@ -292,14 +307,19 @@ fn check_provider(
 }
 
 fn supported_event(event: &str) -> bool {
-    matches!(event, "input.submit" | "tool.before" | "tool.after")
+    matches!(
+        event,
+        "input.submit" | "tool.before" | "tool.after" | "security.violation"
+    )
 }
 
 fn supported_effect(event: &str, effect: &str) -> bool {
     matches!(
         (event, effect),
         ("input.submit" | "tool.before", "observe" | "block")
+            | ("tool.before", "replace_input")
             | ("tool.after", "observe" | "replace_result")
+            | ("security.violation", "observe" | "block")
     )
 }
 

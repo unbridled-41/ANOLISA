@@ -18,12 +18,24 @@ AgentSecCore contributes controls to the [ANOLISA OWASP Agentic Top 10 mapping](
 
 Rust V2 supports `agent-sec-cli sandbox run --permissions permissions.json -- command`
 for local execution with explicit filesystem and network permissions, without a
-daemon. See the [sandbox guide](../../docs/user-guide/en/agent-sec-core/sandbox.md)
+daemon. `--permissions` accepts the existing OS permission JSON or Cedar source;
+Cedar is projected to coarse process-tree permissions. The same input can generate
+each PDP permission request through `PermissionInput` or the Cosh sandbox Hook.
+See the [sandbox guide](../../docs/user-guide/en/agent-sec-core/sandbox.md)
 for the permission format, runtime requirements and isolation boundaries.
 Applications can add policy authorization through `asc-pep-runtime::PepRuntime`,
-using PAP-managed Cedar policies selected by daemon `--authorization-config`.
+using PAP-managed Cedar policies. The daemon enables authorization by default;
+an empty applicable policy set denies requests.
 Successful Policy updates apply to subsequent authorization requests.
-Cosh can opt into this flow with `AGENT_SEC_COSH_SANDBOX_PERMISSIONS`, using its native approval UI.
+Cosh opts into this flow with `AGENT_SEC_COSH_SANDBOX_ALL_SHELL=1`, using its native
+approval UI and the installed default permission template. Every hooked `shell` /
+`run_shell_command` call is authorized, including ordinary Python scripts and original
+`sudo` commands. The switch defaults off; see the sandbox guide for configuration,
+permission boundaries and failure handling.
+Set `AGENT_SEC_COSH_SANDBOX_PERMISSION_SOURCE=command` with an explicit Cedar
+`AGENT_SEC_COSH_SANDBOX_RUNTIME_PERMISSIONS` preset to generate permission requests
+from each original command and cwd. Candidates never update PAP; clarification,
+generation and conversion failures block execution.
 
 ## Background
 
@@ -97,40 +109,19 @@ Conflicting or bypassed existing databases
 refuse startup; explicit `AGENT_SEC_DATA_DIR` remains a fixed path. See
 [Policy storage](../../docs/user-guide/en/agent-sec-core/policy-cli.md#policy-database-location).
 PolicyTemplates are reusable policies with general rules; the PEP Translator
-supports native JSON file-deletion block rules. Policy create/update also accepts Cedar
-source envelopes with an exact schema reference. Cedar admission and source persistence are
-available; Cedar `forbid` deletion/ordinary-write restrictions can be translated and deployed. Native JSON requests and saved
-snapshots retain their format. Scopes save immutable Policy snapshots and own automatic
-Binding creation, reconciliation and cleanup. To authorize non-root Policy CLI callers, configure
-the daemon with `--policy-admin-uid <UID>`; default authorization remains root-only.
+supports native JSON file-deletion block rules. Policy create/update reads raw Cedar files by
+default and saves them with an exact schema reference; `--language json` keeps native JSON
+templates and Cedar source envelopes. Cedar admission and source persistence are
+available; Cedar `forbid` deletion/ordinary-write restrictions can be translated and deployed.
+Native JSON file-policy requests and saved snapshots retain their format.
+Scopes save immutable Policy snapshots and
+own automatic Binding creation, reconciliation and cleanup. To authorize non-root Policy CLI
+callers, configure the daemon with `--policy-admin-uid <UID>`; default authorization remains root-only.
 
 **Breaking change:** `scope create --cgroup-id` has been removed because cgroup
 assignments were not supported. Update scripts to select the intended processes
-with `--pid`, `--process-name`, or `--executable`.
-
-The V2 **Secret Gateway preview** keeps real GitHub credentials out of Agent processes.
-The V2 `agent-sec-core` RPM starts the base daemon automatically but leaves the gateway off; root installs
-mitmproxy explicitly. Raw packages include the same gateway assets but start neither service; the daemon
-alone controls the gateway lifecycle, and uninstall refuses to proceed if routing withdrawal fails.
-`gateway key add github --secret-file /root/github.token` imports without granting access: the same
-secret is idempotent, and a different value is rejected without overwrite.
-Replacement requires remove then add, a new Scope and updated Agent configuration; old fakes are
-permanently retired, with no automatic rotation. Existing native Policy JSON authorizes `network/use_credential` HTTPS
-requests, and a Scope pins that Policy revision with a non-root owner and process selector.
-Prepare the Scope, enable the gateway, query `gateway credentials --scope <scopeId>` as its owner,
-and configure the Agent's fake and CA before starting it. Discovery automatically attaches matching
-instances; it does not guarantee first-packet protection. Instance restarts retain the Scope fake;
-Scope deletion revokes only its fakes, while `gateway key remove github` retires the credential globally.
-Read-only status and credential queries are UID-scoped: status returns `{enabled, ready, scopes}`
-with `{scopeId, bindings}` entries, and credentials returns `{scopeId, environment}`. `ready` requires
-an enabled gateway, a passing read-only cgroup v2 check, active proxy unit, matching loaded generation
-and available CA. Enable checks cgroup v2 before changing enabled state; publication (including enabled
-recovery), enabled status queries and credential queries recheck it. Default-off recovery skips this
-preflight. No cgroup v1 fallback or mount changes occur; nftables `socket cgroupv2` is checked only by
-actual rule application, not an independent preflight. Wait separately for instance Binding `READY`.
-Key list returns active IDs only (`{"credentials":["github"]}`); add/remove return `{"credential":"github"}` and
-successful enable/disable return `{}`. See the
-[Secret Gateway design (Chinese)](docs/design/V2_SECRET_GATEWAY_DESIGN_zh.md).
+with `--pid`, `--process-name`, `--executable`, or `--cmdline-arg`.
+The last selector matches a complete command-line argument for interpreter-hosted processes.
 
 V2 uses native OTel for local log correlation only; it exposes no OTLP exporter.
 Pass Agent attribution through the existing `--trace-context` JSON option, or an
@@ -150,6 +141,25 @@ permissions; unsupported constraints are rejected.
 Upgrade CLI and daemon together for request v1/candidate v1; other versions are
 incompatible. Candidates do not approve, install or enforce policies. See the
 [Intent reference](../../docs/user-guide/en/agent-sec-core/policy-cli.md#intent-propose-a-candidate-from-a-task).
+
+For hook integration, the source-tree V2 API `intent.propose_command` accepts
+`command` and `cwd`, returning a Cedar candidate or clarification reasons; the
+`agent-sec-cli intent propose-command` subcommand exposes it to hook callers. Neither
+updates base policies, maps OS permissions or executes commands. The opt-in Cosh
+Hook combines candidates with an explicit runtime preset and uses the existing
+PDP/sandbox lifecycle. See the [Command Cedar API](v2/README.md#command-cedar-api).
+
+`agent-sec-cli intent init` generates validated Cedar locally from explicit
+rules, with no daemon, model or network:
+
+```bash
+agent-sec-cli intent init --deny-network
+agent-sec-cli intent init --allow-read '/data/**' --allow-write '/data/out/**' --deny-network
+```
+
+The output is an unapproved preview: forbid overrides permit, and anything no
+permit names stays denied by default. See the
+[Intent init reference](../../docs/user-guide/en/agent-sec-core/policy-cli.md#intent-init-generate-cedar-locally-from-explicit-rules).
 
 ## Security Architecture
 
@@ -455,7 +465,7 @@ agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 
 V2 loads custom business rules from `/etc/agent-sec/pii-checker/rules.yaml` at daemon startup;
 `agent-sec-daemon --pii-rules /absolute/path/rules.yaml` selects an alternative. Restart to update.
-V1 retains `~/.config/agent-sec/pii-checker/rules.yaml`. V2 reports coverage, rule identity and `summary.scanner_version: "2.1.1"`;
+V1 retains `~/.config/agent-sec/pii-checker/rules.yaml`. V2 reports coverage, rule identity and `summary.scanner_version: "2.1.2"`;
 a `pass` result with partial coverage does not establish complete detection. This phase preserves
 Hook contracts without switching live hosts or adding PDP enforcement.
 The shared CLI `--trace-context` adapter propagates attribution through the top-level OTel

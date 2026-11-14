@@ -7,17 +7,15 @@ use crate::{
     trace_context,
 };
 use serde_json::{json, Value};
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 pub(super) fn invoke(
     request: &Value,
     config: &Config,
+    transport: crate::Transport,
     cli: &Path,
     socket: &Path,
-    remaining: Duration,
+    remaining: impl Fn() -> Result<Duration, &'static str>,
 ) -> Result<serde_json::Map<String, Value>, &'static str> {
     let policy = config.pii.as_ref().ok_or("pii_not_configured")?;
     let event = &request["event"];
@@ -34,19 +32,25 @@ pub(super) fn invoke(
                 let result = event["tool"].get("result").ok_or("invalid_tool_result")?;
                 (result, Source::ToolOutput, enforcing, "replace_result")
             }
+            (Some("check_final_tool_output"), Some("security.violation")) => (
+                event["tool"].get("result").ok_or("invalid_tool_result")?,
+                Source::ToolOutput,
+                true,
+                "block",
+            ),
             _ => return Err("unsupported_operation_event"),
         };
     if enforcing && !admitted(request, action) {
         return Err("effect_not_admitted");
     }
-    let started = Instant::now();
     let trace = trace_context::from_event(event);
     let scan = |text: &str| {
-        let budget = remaining
-            .checked_sub(started.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or("deadline_exceeded")?;
-        pii::call(cli, socket, text, source, &trace, budget).map_err(|error| error.code())
+        let budget = remaining()?;
+        match transport {
+            crate::Transport::Cli => pii::call(cli, socket, text, source, &trace, budget),
+            crate::Transport::Daemon => pii::call_daemon(socket, text, source, &trace, budget),
+        }
+        .map_err(|error| error.code())
     };
     let verdict = scan_value(value, &scan)?;
     if enforcing && verdict == Verdict::Risk && action == "replace_result" {
@@ -54,7 +58,13 @@ pub(super) fn invoke(
             .as_str()
             .ok_or("unsupported_pii_result")?;
         let mut residual = event["tool"]["result"].clone();
-        if clear_slot(&mut residual, slot) != 1 {
+        let cleared = if !residual.is_string() && residual.to_string().as_str() == slot {
+            residual = Value::Null;
+            1
+        } else {
+            clear_slot(&mut residual, slot)
+        };
+        if cleared != 1 {
             return Err("unsupported_pii_result");
         }
         // Scan the retained envelope too: a credential in stderr, another block

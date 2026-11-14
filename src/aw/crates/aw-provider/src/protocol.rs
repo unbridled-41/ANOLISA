@@ -3,7 +3,7 @@
 use crate::{parsing, Error, REQUEST_SCHEMA, RESPONSE_SCHEMA};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 /// A structurally checked request; it does not grant the requested effects.
 pub struct Request(Value);
@@ -84,17 +84,31 @@ pub enum Reply {
 
 /// Reusable, offline schema and cross-message validator.
 pub struct Protocol {
+    schemas: &'static Schemas,
+}
+
+struct Schemas {
     request: jsonschema::Validator,
     response: jsonschema::Validator,
     event: jsonschema::Validator,
 }
 
 impl Protocol {
-    /// Compiles the bundled schemas without resolving external resources.
+    /// Reuses process-wide bundled schemas without resolving external resources.
+    /// Message correlation and validation still run for every request and reply.
     ///
     /// # Errors
     /// Returns [`Error::InvalidSchema`] if a bundled schema is invalid.
     pub fn new() -> Result<Self, Error> {
+        static SCHEMAS: OnceLock<Result<Schemas, ()>> = OnceLock::new();
+        let schemas = SCHEMAS
+            .get_or_init(|| Self::compile().map_err(|_| ()))
+            .as_ref()
+            .map_err(|_| Error::InvalidSchema)?;
+        Ok(Self { schemas })
+    }
+
+    fn compile() -> Result<Schemas, Error> {
         fn compile(schema: &Value) -> Result<jsonschema::Validator, Error> {
             jsonschema::draft202012::options()
                 .offline()
@@ -105,7 +119,7 @@ impl Protocol {
             serde_json::from_str(REQUEST_SCHEMA).map_err(|_| Error::InvalidSchema)?;
         let response: Value =
             serde_json::from_str(RESPONSE_SCHEMA).map_err(|_| Error::InvalidSchema)?;
-        Ok(Self {
+        Ok(Schemas {
             request: compile(&request)?,
             response: compile(&response)?,
             event: compile(
@@ -123,7 +137,7 @@ impl Protocol {
     /// and a tool result supplied before execution. Bare-event limits apply.
     pub fn validate_event(&self, event: &Value) -> Result<(), Error> {
         encode(event)?;
-        if !self.event.is_valid(event) {
+        if !self.schemas.event.is_valid(event) {
             return Err(Error::Invalid("event schema mismatch"));
         }
         check_event_result(event)
@@ -145,7 +159,7 @@ impl Protocol {
     }
 
     fn check_request_shape(&self, value: &Value) -> Result<(), Error> {
-        if !self.request.is_valid(value) {
+        if !self.schemas.request.is_valid(value) {
             return Err(Error::Invalid("request schema mismatch"));
         }
         if value["method"] == "invoke" {
@@ -156,6 +170,8 @@ impl Protocol {
             for effect in array(&value["allowed_effects"])? {
                 if effect != "observe"
                     && !(before && effect == "block")
+                    && !(value["event"]["name"] == "security.violation" && effect == "block")
+                    && !(value["event"]["name"] == "tool.before" && effect == "replace_input")
                     && !(!before
                         && effect == "replace_result"
                         && value["event"]["name"] == "tool.after")
@@ -240,7 +256,7 @@ impl Protocol {
     /// function does not see process state, authenticate origin or record a receipt.
     pub fn check_response(&self, request: &Request, bytes: &[u8]) -> Result<Reply, Error> {
         let value = parsing::parse(bytes)?;
-        if !self.response.is_valid(&value) {
+        if !self.schemas.response.is_valid(&value) {
             return Err(Error::Invalid("response schema mismatch"));
         }
         if value["request_id"] != request.0["request_id"] {
@@ -289,6 +305,26 @@ impl Protocol {
                 }
                 let mut replacements = 0;
                 for effect in array(&value["effects"])? {
+                    if effect["type"] == "replace_input"
+                        && (value["effects"].as_array().map(Vec::len) != Some(1)
+                            || request.0["event"]["name"] != "tool.before")
+                    {
+                        return Err(Error::Invalid(
+                            "input replacement must be a sole pre-tool effect",
+                        ));
+                    }
+                    if effect["type"] == "replace_input"
+                        && request.0["event"]["tool"]["input"]
+                            .as_object()
+                            .zip(effect["input"].as_object())
+                            .is_none_or(|(original, candidate)| {
+                                original.keys().any(|key| !candidate.contains_key(key))
+                            })
+                    {
+                        return Err(Error::Invalid(
+                            "input replacement must retain original argument keys",
+                        ));
+                    }
                     if effect["type"] == "replace_result" {
                         replacements += 1;
                         if replacements > 1 {
@@ -356,4 +392,22 @@ fn binding(value: &Value) -> Result<String, Error> {
         .ok_or(Error::Invalid("expected request object"))?
         .remove("input_digest");
     Ok(format!("sha256:{:x}", Sha256::digest(encode(&value)?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_protocols_share_only_immutable_schemas() {
+        let first = Protocol::new().unwrap();
+        std::thread::scope(|scope| {
+            let second = scope.spawn(|| Protocol::new().unwrap()).join().unwrap();
+            assert!(std::ptr::eq(first.schemas, second.schemas));
+            for protocol in [&first, &second] {
+                assert!(protocol.parse_request(br#"{"method":"invoke"}"#).is_err());
+                assert!(protocol.validate_event(&serde_json::json!({})).is_err());
+            }
+        });
+    }
 }

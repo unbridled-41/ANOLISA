@@ -127,10 +127,12 @@ fenced code with its language, links with targets, image alt text, quotes, and
 admonitions. MathML formulas render as their TeX annotation or `alttext` between `$`
 signs; cells spanning rows or columns leave empty cells in the slots they cover, rows
 are not padded to the widest row, and a table's first header and footer groups are
-placed where a browser draws them, at the top and bottom; paragraph lines that start
-like a Markdown heading, list item, quote, rule or code fence are escaped. The content
-root is `<main>`, an element with `role=main`, or the only outermost `<article>`
-(articles nested inside it, such as comments, do not count); otherwise the whole body.
+placed where a browser draws them, at the top and bottom; ordered lists keep the
+numbers a browser shows, following `start`, `reversed` and an item's `value`;
+paragraph lines that start like a Markdown heading, list item, quote, rule or code
+fence are escaped. The content root is `<main>`, an element with `role=main`, or the
+only outermost `<article>` (articles nested inside it, such as comments, do not
+count); otherwise the whole body.
 Scripts, styles, `noscript`, templates, SVG, iframes, comments, `nav`, `aside`,
 page-level `header`/`footer`, elements with navigation, banner, contentinfo, or
 complementary roles, form controls (`button`, `input`, `select`, `textarea`,
@@ -163,76 +165,93 @@ Local rendering and original recovery have been verified on finite samples.
 ### HTML inside JSON values
 
 The same switch also covers HTML carried inside JSON results, such as an API record
-whose `content` or `body` field holds rich text. Field names play no part: a string
-value is considered when it is at least 256 characters long, starts with a supported
-tag, a comment, or `<!doctype html`, and ends with `>`. Results from printed local
-files (`file_read`) keep their HTML verbatim, as above. A text replacement slot is not
-required, because the result stays JSON. An available Stash and a supported recovery
-method are required.
+whose `content` or `body` field holds rich text or an UI card. Field names play no part:
+a string value is considered when it is at least 256 characters long, starts with a
+supported HTML5 or SVG tag, a comment, or `<!doctype html`, and ends with `>`. Results
+from printed local files (`file_read`) keep their HTML verbatim, as above. A text
+replacement slot is not required, because the result stays JSON. An available Stash and
+a supported recovery method are required.
 
 Only the value changes. Field names, other values, JSON types, exact number literals,
 and the position of the value in its record are kept. The new value starts with a line
 such as `[HTML rendered as Markdown; removed 1 style. If needed, run in shell: tokenless
-retrieve <hash>]`, followed by the Markdown. The instruction retrieves that one value
-exactly as received. Serialized JSON inside a string is never parsed or turned into an
-object.
+retrieve <hash>]`, followed by the hybrid Markdown view. The instruction retrieves that
+one value exactly as received. Serialized JSON inside a string is never parsed or turned
+into an object.
 
-Unlike a page, a value is rendered whole and nothing visible is removed. Only style
-sheets and comments are removed and counted in the first line, and cosmetic styling
-is not printed. Line breaks from `br` and block elements are kept, also inside code.
-Button labels stay as separate text, images without alt text and links without text
-keep their targets, and a link or image tooltip (`title`) becomes its Markdown title.
-A value passes through unchanged when the view could change what a reader sees or
-lose a fact. Styling cannot be printed, so a value is rewritten only when no text
-the view would show is hidden or illegible on screen:
+Unlike a page, a value is rendered whole and nothing visible is removed. Only cosmetic
+style sheets and comments are removed and counted in the first line, and cosmetic inline
+styling (including non-reordering flex/grid layout, spacing, shadows, outlines, and
+presentational attributes) is dropped. Line breaks from `br` and block elements are
+kept, also inside code. Plain button labels and adjacent flex or `inline-block` items
+stay separated as distinct words, images without alt text and links without text keep
+their targets, a link or image tooltip (`title`) becomes its Markdown title, and `id`
+or `name` anchors referenced within the fragment (such as `#section` links or `for`,
+`headers`, and `aria-*` references) are retained while unused anchors drop.
 
-- Form fields and their state (`input`, `select`, `textarea`, `form`, `label`).
-- Scripts, templates, media, frames, SVG, MathML, and elements outside HTML.
-- Page chrome (`nav`, `header`, `footer`, `aside`, or a navigation, banner,
-  contentinfo, or complementary role).
-- `del`, `ins`, `s`, `sub`, `sup`, `q`, `time`, `data`, `bdo`, `base`, and `link`.
-- Styles in a `style` attribute or a `<style>` sheet of the value that do more than
-  change colors, fonts, alignment, borders, sizes, or spacing. This covers
-  strike-through, raised or lowered text, hidden or generated content, list markers,
-  preserved line breaks, symbol fonts such as Wingdings, negative or very wide letter
-  or word spacing, and properties, values, or functions such as `calc()` that the
-  check cannot read. Selectors are not matched, so a `<style>` rule must pass for any
-  element it could reach. The `hidden` attribute also passes through.
+Elements or attributes whose meaning Markdown cannot express stay in place as compact
+HTML around compressed rich-text subtrees instead of forcing the whole field back to raw
+HTML:
+
+- Inline `<svg>` icons and graphics (including namespaced attributes such as
+  `xlink:href`, with cosmetic outer `style`/`class` stripped) and valid JSON data blocks
+  in `<script type="application/json">` or `<script type="application/ld+json">` without
+  `src`.
+- Semantic containers (`nav`, `header`, `footer`, `aside`, `hgroup`, `search`, or
+  containers carrying `data-*`, `aria-*`, non-presentational `role`, `cite`, or a
+  referenced `id`), which keep their HTML open and close tags while compressing eligible
+  rich text inside them.
+- Non-GFM tables (multiple header rows, mid-table header rows, nested tables, or
+  multi-line cells) and lists whose numbering or item state Markdown would alter
+  (`reversed`, `type`, `li[value]`, non-plain `start`, empty numbered items, or
+  `data-*`/`aria-*` task items), which keep coherent HTML table or list tags and
+  compress rich text inside cells or items when present.
+- Form controls and state (`input`, `select`, `textarea`, `form`, `label`, and `button`
+  elements carrying `name`, `value`, `disabled`, or `data-*`/`aria-*`), media (`audio`,
+  `video`, `picture`, `canvas`), local phrasing tags (`del`, `ins`, `s`, `sub`, `sup`,
+  `q`, `time`, `data`, `abbr` with `title`, `bdi`, `bdo`, `ruby`), non-empty
+  `aria-hidden` icon ligatures, inline `line-through`, `sub`/`super` or bounded
+  `vertical-align`, preserved `white-space`, and `javascript:`, `data:`, or
+  unbalanced-bracket links and images.
+
+A value still passes through unchanged as a whole when global safety cannot be verified,
+when the view could reveal hidden text or obscure legible text, or when no subtree
+converts to Markdown:
+
+- Executable or external `<script>` elements, inline event handlers (`on*`),
+  `javascript:` or `data:` form actions, `<template>`, frames and embedded objects
+  (`iframe`, `frame`, `object`, `embed`, `portal`, `fencedframe`), MathML, custom
+  elements or XML tags outside HTML/SVG, `<base>`, and `<link>`.
+- Metadata the view would drop: a `meta` other than a character set, content type,
+  compatibility mode, viewport, or mail formatting hint (so a description or refresh
+  passes through), and a `title` outside the head or after the first.
+- Content a browser shows only after the reader acts: the body of a closed `details`, or
+  a `details` without a `summary` or grouped by `name`.
+- `<style>` rules that go beyond cosmetic colors, fonts, alignment, borders, sizes, or
+  spacing (selectors are not matched, so a sheet rule cannot be localized to one
+  element), the `hidden` attribute, hidden or generated content, non-zero flex/grid
+  `order`, `flex-basis: 0` clipping, symbol fonts such as Wingdings, negative or very
+  wide letter or word spacing, and CSS escapes, vendor prefixes, custom properties, or
+  functions such as `var()` that the check cannot read.
 - Text that its styling makes hard or impossible to see. Colors, sizes, and line
   heights are followed through the value's inline styles, presentational attributes
   such as `bgcolor` or a `font` element's `color`, its `<style>` sheets and column
-  backgrounds, and a browser's defaults for links, marks, and buttons. Any text with a
-  contrast ratio below 1.5 against a color it may sit on (white on white, or text the
-  color of the page) passes the value through, as does text over a background image or
-  gradient, smaller than 6 pixels, or with lines closer than half its font size. So do
-  a fixed width or height that text could overflow onto other content, and an inline
-  element's vertical padding or border taller than 8 pixels, or a text decoration with
-  a set thickness, either of which can paint over neighboring lines. The page behind
-  the value is taken to be a browser's default: white, with black 16-pixel text.
-  Stylesheets outside the value, such as those of the application that displays it,
-  its dark mode, or fonts it loads, are unknown and not considered. Margins or padding
-  may move text right or down, where a page scrolls to it; whether the displaying
-  application clips it there is also unknown.
-- Attributes the view cannot show, such as `data-*` values, `aria-*` labels and
-  states, a tooltip on elements other than links and images, `abbr` on table
-  headers, a quote's `cite`, a download file name, or a button's value or state.
-  Text inside an `aria-hidden` element also passes through, because it may be an
-  icon ligature.
-- Metadata the view would drop: a `meta` other than a character set, content type,
-  compatibility mode, viewport, or mail formatting hint (so a description or a
-  refresh passes through), and a `title` outside the head or after the first.
-- Content a browser shows only after the reader acts: the body of a closed
-  `details`. A `details` without a `summary`, or grouped by `name`, also passes
-  through.
-- Ordered lists whose numbers the view could not reproduce: reversed or lettered
-  lists, a `start` other than a plain non-negative number, items with an explicit
-  `value`, empty items, or content between items.
-- Tables nested in a cell, cells containing line breaks, or a row of headers anywhere
-  but the top, such as a second header row or a section label, since a Markdown table
-  has one header row.
-- `javascript:` or `data:` targets, any text or target that would not appear in the
-  view in the order a browser draws it, or text a browser shows apart that the view
-  would run together.
+  backgrounds, and a browser's defaults for links, marks, buttons, and form fields
+  (skipping non-rendered `<script>`, `<style>`, and SVG metadata/definition nodes). Any
+  text with a contrast ratio below 1.5 against a color it may sit on (white on white, or
+  text the color of the page) passes the value through, as does text over a background
+  image or gradient, smaller than 6 pixels, or with lines closer than half its font
+  size. So do a fixed width or height that text could overflow onto other content, and
+  an inline element's vertical padding or border taller than 8 pixels, or a text
+  decoration with a set thickness, either of which can paint over neighboring lines. The
+  page behind the value is taken to be a browser's default: white, with black 16-pixel
+  text. Stylesheets outside the value, such as those of the application that displays
+  it, its dark mode, or fonts it loads, are unknown and not considered. Margins or
+  padding may move text right or down, where a page scrolls to it; whether the
+  displaying application clips it there is also unknown.
+- Any visible text, retained HTML tag, or link/image target that would not appear in the
+  view in browser source order, or text a browser shows apart that the view would run
+  together.
 
 Each rewritten value must save at least 16 estimated tokens in its JSON-escaped form,
 including its first line, and the rewritten document must be smaller than the compact
@@ -250,6 +269,43 @@ The response reports `html_extraction` with content type `json` and recoverabili
 pages (`html`). These rules have been verified with synthetic fragments and documents;
 they are guards, not proof that every fragment keeps its meaning for a model.
 
+## Optional mixed-content region compression
+
+Mixed-content region compression is disabled by default. Set
+`TOKENLESS_MIXED_CONTENT_ENABLED=1` in the environment inherited by Tokenless or its
+host agent to enable it; unset the variable or set it to `0` to disable it. `1`,
+`true`, and `yes` enable it (case-insensitively). This option is independent of the
+general compression switch and is not a `config.json` field. With it enabled,
+`TOKENLESS_COMPRESSION_ENABLED=0` measures candidates but returns the original.
+
+Python `TokenlessConfig` reads this environment variable by default; an explicit
+`mixed_content_enabled` argument takes precedence. Rust and direct native binding
+callers set `RuntimeConfig.mixed_content_enabled` to `true` or pass the native
+`TokenlessRuntime(mixed_content_enabled=True)` keyword.
+
+The route handles tool outputs that are neither a whole structured document nor
+handled by another domain. It recognizes explicitly bounded typed regions — fenced
+code blocks labeled `json`, `csv`, or `tsv` (indented at most three spaces, closed by
+a fence of the same marker at least as long), and bare JSON documents that start with
+`{` or `[` within the first three columns and balance their brackets — and compresses
+each region with the same compressor and policy as the standalone route. Prose,
+logs, and separators around regions stay byte-for-byte; a region the compressor
+rejects stays verbatim; a fenced JSON region that selects TOON has its fence label
+rewritten to `toon` (only the info word is replaced; the remaining attributes keep
+their text and order); an unclosed fence or an unbalanced document protects its
+remainder. Regions are recognized only inside the same 64 KiB / 200-line detection
+window the other domains use; a region opening past it is preserved verbatim. Regions
+run only when the output is neither from Grep nor a recognized shell `grep`/`rg`
+command and the host can replace output with text. Search output stays excluded even
+when search path sharing is disabled. The whole candidate still passes the pipeline's
+character and token arbitration. A candidate with no changed region, no tentative
+Stash write, and no Stash error passes through; an unchanged candidate carrying
+tentative writes reports `no_savings` and rolls them back. Any region's Stash write
+failure rolls back all tentative writes from the request, including successful writes
+from other regions, before the runtime reports the storage error.
+
+Local region compression and reconstruction have been verified on finite samples.
+
 ## Environment variables
 
 ### Common user variables
@@ -265,6 +321,7 @@ they are guards, not proof that every fragment keeps its meaning for a model.
 | `TOKENLESS_SLS_PATH` | Override the SLS JSONL path | Must be under `/var/log/` or `/tmp/` |
 | `TOKENLESS_DIFF_COMPRESSION_ENABLED` | Enable Git Diff context cropping | On by default; `0` disables; explicit SDK options take precedence |
 | `TOKENLESS_HTML_EXTRACTION_ENABLED` | Switch HTML page rendering, including HTML inside JSON values | On by default; `1`, `true`, or `yes` enables, any other non-empty value disables; does not override SDK options |
+| `TOKENLESS_MIXED_CONTENT_ENABLED` | Enable mixed-content region compression | Off by default; `1`, `true`, or `yes` enables; does not override SDK options |
 
 ### Adapter and diagnostic variables
 

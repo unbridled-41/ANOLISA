@@ -10,11 +10,16 @@ The verified baseline is QwenPaw 2.2.2.post1 with AgentScope 2.0.10. Install Qwe
 with its compatible dependencies and initialize its model configuration through
 QwenPaw. AW records the installed version and checks the plugin, middleware and
 native task lifecycle interfaces for other releases. The example uses `argv: [qwenpaw, app]`. Set
-`QWENPAW_WORKING_DIR` to the existing initialized absolute directory. AW adds only
-its owned temporary plugin, preserves existing plugins and native configuration,
-and removes its plugin after the App exits. Each installation has its own
-`aw-native-<uuid>` directory and manifest ID, preserving user-owned `aw-native`
-plugins and settings. AW leaves `config.json` loading and native MCP updates to
+`QWENPAW_WORKING_DIR` to the existing initialized absolute directory. Ordinary
+launches through recognized absolute pip/uv console scripts, including uv relocatable
+entrypoints, register AW through
+the native Registry from a private temporary package. This avoids the filesystem
+plugin loader's module sweep and leaves the workspace plugin directory untouched.
+AW owns this integration and its cleanup; it does not appear in QwenPaw's
+filesystem plugin inventory. Custom entrypoints, `--reloadable` and external
+startup integration retain the native plugin loader. Each installation has its
+own `aw-native-<uuid>` directory and manifest ID, preserving user-owned
+`aw-native` plugins and settings. AW leaves `config.json` loading and native MCP updates to
 QwenPaw. Native factory arguments are forwarded unchanged, and tool generators
 finish cleanup before their terminal result reaches the Coordinator.
 
@@ -74,6 +79,43 @@ The native Hook output dialect and event coverage remain framework-specific.
 An ordinary configuration with no Providers or event steps still installs
 resident admission and cleanup middleware.
 The shared sec-core Provider also supports [Skill validation before loading](../providers/sec-core.md#validate-skills-before-loading). Configure `check_skill` on `tool.before` for the native `Skill` tool and authorize its canonical source directories in the daemon.
+
+AW recognizes standard CLI entrypoints by Python syntax, allowing installer comments,
+quote styles and formatting. UV relocatable entrypoints use the interpreter beside
+the resolved console script. Probing and managed startup share this recognition
+result. Literal installed versions use the same interpreter and import path without
+importing App configuration. Custom entrypoints and nonliteral versions retain the native
+`--version` probe within the same five-second budget. Native Hook installation
+and readiness checks retain the native interfaces. Managed console
+launches execute the original script in the same interpreter and process, with
+its original arguments and import precedence. User plugins keep their native
+loading and isolation. Requests arriving before the acknowledged startup receipt
+wait up to 30 seconds before Agent construction. This boundary is installed
+before the console script runs, covering requests during Hub initialization
+before the first plugin phase. Construction also requires the resident middleware
+installation guard. AW module imports begin in
+the native plugin initialization phase, before Agent loading. Initialization
+failure stops the App; a missing or mismatched receipt blocks Agent construction.
+
+## Separate HTTP startup and first protected work
+
+Measure launch-to-HTTP, HTTP-to-Agent-ready and first-Hook latency separately.
+An HTTP listener can precede Agent and plugin startup; its availability alone
+does not establish that protected requests can run.
+
+For deployments using the [sec-core first-use barrier](../providers/sec-core.md#overlap-backend-and-agent-startup),
+the external supervisor can remove backend health from the App launch prerequisite.
+On a CPU-limited container, start scanner prewarm after the HTTP milestone to
+avoid competing with the App's early imports, or initialize capabilities on first
+use. Warm only capabilities referenced by the active policy. HTTP startup is
+then independent of backend readiness; required Hook installation, policy
+admission and the actual check still precede protected model or tool work.
+Starting the backend or prewarm at that milestone belongs to the supervisor;
+`aw run` does not schedule or own those external processes.
+If App initialization itself performs protected operations, start the backend
+independently of HTTP availability so those operations cannot wait on a backend
+whose startup requires their completion. Defer only explicit scanner prewarm in
+that case; the first actual check still initializes its required capability.
 
 ## Keep the native App startup command
 

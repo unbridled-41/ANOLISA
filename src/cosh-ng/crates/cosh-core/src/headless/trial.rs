@@ -18,22 +18,6 @@ pub(super) enum Prepared {
     Trial,
 }
 
-pub(super) fn restored_model_config(engine: &CoshCore) -> Option<crate::config::CoreConfig> {
-    (engine.is_session_resumed()
-        && trial_policy::decide(
-            &engine.config,
-            &ProviderIntent::from_env(),
-            true,
-            true,
-            true,
-        ) == TrialDecision::EcsIdentity)
-        .then(|| {
-            let mut config = engine.config.clone();
-            config.ai.active_model = Some(engine.model.clone());
-            config
-        })
-}
-
 pub(super) async fn prepare(
     engine: &mut CoshCore,
     capable: bool,
@@ -57,7 +41,7 @@ pub(super) async fn prepare(
         preference.unwrap_or(false),
     );
     result.map_err(|code| {
-        if code == "ModelNotConfigured" {
+        if matches!(code, "ModelNotConfigured" | "EcsTrialDisabled") {
             preference.err().map(|error| error.code()).unwrap_or(code)
         } else {
             code
@@ -105,8 +89,16 @@ fn apply_policy(
             Ok(Prepared::Existing)
         }
         TrialDecision::Disabled => {
-            engine.provider = super::auth::unconfigured_provider();
-            Err("ModelNotConfigured")
+            let code = if context.as_ref().is_some_and(|context| {
+                context.intent == TrialIntent::UserInitiated
+                    && (!context.auto_use_allowed || !persistent_auto_use)
+            }) {
+                "EcsTrialDisabled"
+            } else {
+                "ModelNotConfigured"
+            };
+            engine.provider = super::auth::unconfigured_provider_for(code);
+            Err(code)
         }
         TrialDecision::EcsIdentity => {
             let selected_name = engine.config.ai.active_provider.as_deref().or_else(|| {
@@ -117,9 +109,7 @@ fn apply_policy(
             let resolved = selected_name
                 .map(|name| engine.config.resolve_named_provider(name))
                 .unwrap_or(resolved);
-            if !engine.is_session_resumed() {
-                engine.model = trial_policy::model(&engine.config);
-            }
+            engine.model = trial_policy::MODEL.to_string();
             engine.extra_params = resolved.extra_params;
             let endpoint = resolved.sysom_endpoint;
             let cached = engine
@@ -219,6 +209,101 @@ mod tests {
     }
 
     #[test]
+    fn review_regression_disabled_auto_access_is_not_missing_model_configuration() {
+        for identity_configured in [false, true] {
+            for (allowed, persistent) in [(false, true), (true, false)] {
+                let mut config = CoreConfig::default();
+                if identity_configured {
+                    config.ai.providers.insert(
+                        "console".into(),
+                        crate::config::ProviderConfig {
+                            provider_type: Some("aliyun".into()),
+                            auth_source: Some("ecs_identity".into()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let mut core = CoshCore::new_legacy(
+                    config,
+                    Box::new(MockProvider::history_echo()),
+                    ToolRegistry::new(),
+                );
+                assert_eq!(
+                    super::apply_policy(
+                        &mut core,
+                        true,
+                        Some(context(allowed)),
+                        &ProviderIntent::default(),
+                        persistent,
+                    ),
+                    Err("EcsTrialDisabled"),
+                    "identity_configured={identity_configured}, allowed={allowed}, persistent={persistent}"
+                );
+                assert!(core.trial_access.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn review_regression_missing_trial_context_still_reports_missing_configuration() {
+        let mut core = CoshCore::new_legacy(
+            CoreConfig::default(),
+            Box::new(MockProvider::history_echo()),
+            ToolRegistry::new(),
+        );
+        assert_eq!(
+            super::apply_policy(&mut core, true, None, &ProviderIntent::default(), true),
+            Err("ModelNotConfigured")
+        );
+    }
+
+    #[test]
+    fn review_regression_non_user_context_does_not_report_automatic_access_disabled() {
+        for persistent in [false, true] {
+            let mut core = CoshCore::new_legacy(
+                CoreConfig::default(),
+                Box::new(MockProvider::history_echo()),
+                ToolRegistry::new(),
+            );
+            let mut request = context(false);
+            request.intent = crate::protocol::ecs_trial::TrialIntent::InternalBestEffort;
+            assert_eq!(
+                super::apply_policy(
+                    &mut core,
+                    true,
+                    Some(request),
+                    &ProviderIntent::default(),
+                    persistent
+                ),
+                Err("ModelNotConfigured")
+            );
+        }
+    }
+
+    #[test]
+    fn review_regression_preference_read_error_remains_specific() {
+        let _lock = crate::sls::tests::ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::sls::tests::EnvVarGuard::set("HOME", home.path().to_str().unwrap());
+        let directory = home.path().join(".copilot-shell/cosh");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("preferences.toml"), "invalid = [").unwrap();
+        let mut core = CoshCore::new_legacy(
+            CoreConfig::default(),
+            Box::new(MockProvider::history_echo()),
+            ToolRegistry::new(),
+        );
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::prepare(&mut core, true, Some(context(true))));
+        assert_eq!(result, Err("trial_preferences_invalid"));
+    }
+
+    #[test]
     fn ecs_trial_selects_its_default_model_without_changing_configuration() {
         let mut core = CoshCore::new_legacy(
             CoreConfig::default(),
@@ -233,12 +318,12 @@ mod tests {
             true,
         )
         .is_ok());
-        assert_eq!(core.model, "qwen3.7-plus");
+        assert_eq!(core.model, "auto");
         assert_eq!(core.config.ai.active_model, None);
     }
 
     #[test]
-    fn singleton_identity_provider_preserves_endpoint_model_and_extra_params() {
+    fn singleton_identity_provider_preserves_endpoint_and_params_with_fixed_model() {
         let endpoint = "https://sysom.cn-hangzhou.aliyuncs.com";
         let extra = serde_json::json!({"enable_thinking":false});
         let mut config = CoreConfig::default();
@@ -270,14 +355,14 @@ mod tests {
             super::Prepared::Trial
         );
         assert_eq!(core.trial_identity_provider.as_ref().unwrap().0, endpoint);
-        assert_eq!(core.model, "selected-model");
+        assert_eq!(core.model, "auto");
         assert_eq!(core.extra_params, Some(extra));
         assert_eq!(core.config.ai.active_provider, None);
         assert_eq!(core.config.user_ai.active_provider, None);
     }
 
     #[test]
-    fn ecs_trial_preserves_an_explicit_model() {
+    fn ecs_trial_ignores_an_explicit_model_override() {
         let mut config = CoreConfig::default();
         config.ai.active_model = Some("custom-model".to_string());
         let mut core = CoshCore::new_legacy(
@@ -293,11 +378,11 @@ mod tests {
             true,
         )
         .is_ok());
-        assert_eq!(core.model, "custom-model");
+        assert_eq!(core.model, "auto");
     }
 
     #[test]
-    fn ecs_trial_preserves_a_provider_model() {
+    fn ecs_trial_ignores_a_provider_model_override() {
         for name in ["default", "generic"] {
             let mut config = CoreConfig::default();
             config.ai.providers.insert(
@@ -320,7 +405,7 @@ mod tests {
                 true,
             )
             .is_ok());
-            assert_eq!(core.model, "provider-model", "{name}");
+            assert_eq!(core.model, "auto", "{name}");
         }
     }
 
@@ -355,7 +440,7 @@ mod tests {
                 true
             )
             .unwrap_err(),
-            "ModelNotConfigured"
+            "EcsTrialDisabled"
         );
         assert!(core.trial_access.is_none());
     }
@@ -378,7 +463,7 @@ mod tests {
                 false
             )
             .unwrap_err(),
-            "ModelNotConfigured"
+            "EcsTrialDisabled"
         );
         assert!(core.trial_access.is_none());
     }
@@ -431,7 +516,7 @@ mod tests {
                 engine.set_session_resumed(true);
                 engine.model = "resumed-trial-model".into();
             }
-            let expected_model = if resumed { "resumed-trial-model" } else { "qwen3.7-plus" };
+            let expected_model = "auto";
             let configured_model_before = engine.config.ai.active_model.clone();
             let messages_before = serde_json::to_value(&engine.messages).unwrap();
             runtime.persist(&engine).unwrap();
@@ -492,12 +577,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trial_preserves_saved_model_after_session_resume() {
-        use super::super::{
-            process_input_line, CliArgs, HeadlessExtensionRuntime, ProtocolState, SessionRuntime,
-        };
+    async fn trial_normalizes_legacy_session_and_cli_models_to_auto() {
+        use super::super::{CliArgs, SessionRuntime};
         use clap::Parser;
-        use tokio::io::AsyncBufReadExt;
 
         for (saved_model, configured_model, cli_model) in [
             ("custom-model", None, None),
@@ -518,40 +600,7 @@ mod tests {
                 .unwrap(),
                 super::Prepared::Trial
             );
-            let args = CliArgs::try_parse_from([
-                "cosh-core",
-                "--headless",
-                "--bare",
-                "--cosh-shell-transport",
-            ])
-            .unwrap();
-            let live = crate::registry::LiveExtensionRuntime::new(
-                engine.extension_generation.clone(),
-                false,
-                false,
-                None,
-            );
-            let mut extensions = HeadlessExtensionRuntime {
-                manager: None,
-                live: &live,
-            };
-            let mut protocol = ProtocolState::new(args.execution_profile);
-            let mut lines = tokio::io::BufReader::new(&b""[..]).lines();
-            let mut output = Vec::new();
-            let line = serde_json::json!({"type":"control_request","request_id":"model-switch",
-                "request":{"subtype":"switch_model","model":saved_model}})
-            .to_string();
-            process_input_line(
-                &line,
-                &mut engine,
-                &mut lines,
-                &mut output,
-                &args,
-                &mut runtime,
-                &mut extensions,
-                &mut protocol,
-            )
-            .await;
+            engine.model = saved_model.to_string();
             runtime.persist(&engine).unwrap();
             let session_id = runtime.record.session_id.to_string();
             drop(runtime);
@@ -597,7 +646,7 @@ mod tests {
                     .unwrap(),
                     super::Prepared::Trial
                 );
-                assert_eq!(engine.model, cli_model.unwrap_or(saved_model));
+                assert_eq!(engine.model, "auto");
             }
             assert_eq!(engine.config.user_ai.active_model, None);
             runtime.persist(&engine).unwrap();
@@ -607,92 +656,175 @@ mod tests {
                 .unwrap()
                 .load(&runtime.record.session_id)
                 .unwrap();
-            assert_eq!(saved.model, cli_model.unwrap_or(saved_model));
+            assert_eq!(saved.model, "auto");
         }
     }
 
-    #[tokio::test]
-    async fn trial_preserves_runtime_model_switch_without_persisting_configuration() {
+    #[test]
+    fn trial_model_switch_cannot_change_automatic_access() {
         use super::super::{process_input_line, CliArgs, HeadlessExtensionRuntime, ProtocolState};
         use clap::Parser;
         use tokio::io::AsyncBufReadExt;
-        for (model, already_trial) in [
-            ("custom-model", false),
-            ("qwen-max", false),
-            ("custom-model", true),
-        ] {
-            let (_root, mut runtime, mut engine) =
-                super::super::live_state_tests::background_compaction_fixture();
-            let args = CliArgs::try_parse_from([
-                "cosh-core",
-                "--headless",
-                "--bare",
-                "--cosh-shell-transport",
-            ])
-            .unwrap();
-            let live = crate::registry::LiveExtensionRuntime::new(
-                engine.extension_generation.clone(),
-                false,
-                false,
-                None,
-            );
-            let mut extensions = HeadlessExtensionRuntime {
-                manager: None,
-                live: &live,
-            };
-            let mut protocol = ProtocolState::new(args.execution_profile);
-            let mut lines = tokio::io::BufReader::new(&b""[..]).lines();
-            let mut output = Vec::new();
-            let context = || {
-                serde_json::from_value(serde_json::json!({
-                    "schema_version":1,"shell_session_id":"model-switch-test",
-                    "intent":"user_initiated","auto_use_allowed":true
-                }))
-                .unwrap()
-            };
-            if already_trial {
-                assert_eq!(
-                    super::apply_policy(
-                        &mut engine,
-                        true,
-                        Some(context()),
-                        &ProviderIntent::default(),
-                        true
-                    )
-                    .unwrap(),
-                    super::Prepared::Trial
-                );
+
+        struct ProviderEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+        impl Drop for ProviderEnvironment {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
-            let line = serde_json::json!({"type":"control_request","request_id":"model-switch",
+        }
+
+        let _lock = crate::sls::tests::ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let provider_env = [
+            "COSH_AI_PROVIDER",
+            "OPENAI_BASE_URL",
+            "COSH_SYSOM_ENDPOINT",
+            "COSH_SYSOM_VPC_PROXY_HOST",
+            "DASHSCOPE_API_KEY",
+            "OPENAI_API_KEY",
+            "ALIBABA_CLOUD_ACCESS_KEY_ID",
+            "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+            "ALIBABA_CLOUD_SECURITY_TOKEN",
+        ];
+        let expected_environment = provider_env.map(|key| (key, std::env::var_os(key)));
+        let environment = ProviderEnvironment(expected_environment.to_vec());
+        for key in provider_env {
+            std::env::remove_var(key);
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for (model, already_trial) in [
+                    ("custom-model", false),
+                    ("qwen-max", false),
+                    ("custom-model", true),
+                ] {
+                    let (_root, mut runtime, mut engine) =
+                        super::super::live_state_tests::background_compaction_fixture();
+                    let args = CliArgs::try_parse_from([
+                        "cosh-core",
+                        "--headless",
+                        "--bare",
+                        "--cosh-shell-transport",
+                    ])
+                    .unwrap();
+                    let live = crate::registry::LiveExtensionRuntime::new(
+                        engine.extension_generation.clone(),
+                        false,
+                        false,
+                        None,
+                    );
+                    let mut extensions = HeadlessExtensionRuntime {
+                        manager: None,
+                        live: &live,
+                    };
+                    let mut protocol = ProtocolState::new(args.execution_profile);
+                    let mut lines = tokio::io::BufReader::new(&b""[..]).lines();
+                    let mut output = Vec::new();
+                    let context = || {
+                        serde_json::from_value(serde_json::json!({
+                            "schema_version":1,"shell_session_id":"model-switch-test",
+                            "intent":"user_initiated","auto_use_allowed":true
+                        }))
+                        .unwrap()
+                    };
+                    if already_trial {
+                        assert_eq!(
+                            super::apply_policy(
+                                &mut engine,
+                                true,
+                                Some(context()),
+                                &ProviderIntent::default(),
+                                true
+                            )
+                            .unwrap(),
+                            super::Prepared::Trial
+                        );
+                    }
+                    let line =
+                        serde_json::json!({"type":"control_request","request_id":"model-switch",
             "request":{"subtype":"switch_model","model":model}})
-            .to_string();
-            process_input_line(
-                &line,
-                &mut engine,
-                &mut lines,
-                &mut output,
-                &args,
-                &mut runtime,
-                &mut extensions,
-                &mut protocol,
-            )
-            .await;
-            assert_eq!(engine.config.ai.active_model.as_deref(), Some(model));
-            for _ in 0..2 {
-                assert_eq!(
-                    super::apply_policy(
+                        .to_string();
+                    process_input_line(
+                        &line,
                         &mut engine,
-                        true,
-                        Some(context()),
-                        &ProviderIntent::default(),
-                        true
+                        &mut lines,
+                        &mut output,
+                        &args,
+                        &mut runtime,
+                        &mut extensions,
+                        &mut protocol,
                     )
-                    .unwrap(),
-                    super::Prepared::Trial
-                );
-                assert_eq!(engine.model, model);
-            }
-            assert_eq!(engine.config.user_ai.active_model, None);
+                    .await;
+                    if already_trial {
+                        assert!(engine.config.ai.active_model.is_none());
+                        assert!(String::from_utf8_lossy(&output).contains("EcsTrialModelFixed"));
+                    } else {
+                        assert_eq!(engine.config.ai.active_model.as_deref(), Some(model));
+                    }
+                    for _ in 0..2 {
+                        assert_eq!(
+                            super::apply_policy(
+                                &mut engine,
+                                true,
+                                Some(context()),
+                                &ProviderIntent::default(),
+                                true
+                            )
+                            .unwrap(),
+                            super::Prepared::Trial
+                        );
+                        assert_eq!(engine.model, "auto");
+                    }
+                    assert_eq!(engine.config.user_ai.active_model, None);
+                    engine.config.ai.active_provider = Some("custom".into());
+                    engine.config.ai.providers.insert(
+                        "custom".into(),
+                        crate::config::ProviderConfig {
+                            provider_type: Some("mock".into()),
+                            ..Default::default()
+                        },
+                    );
+                    output.clear();
+                    process_input_line(
+                        &line,
+                        &mut engine,
+                        &mut lines,
+                        &mut output,
+                        &args,
+                        &mut runtime,
+                        &mut extensions,
+                        &mut protocol,
+                    )
+                    .await;
+                    assert_eq!(engine.model, model);
+                    assert!(String::from_utf8_lossy(&output).contains("model_switched"));
+                    assert_eq!(
+                        super::apply_policy(
+                            &mut engine,
+                            true,
+                            Some(context()),
+                            &ProviderIntent::default(),
+                            true
+                        )
+                        .unwrap(),
+                        super::Prepared::Existing
+                    );
+                    assert_eq!(engine.model, model);
+                }
+            });
+        drop(environment);
+        for (key, expected) in expected_environment {
+            assert_eq!(std::env::var_os(key), expected, "{key}");
         }
     }
 }

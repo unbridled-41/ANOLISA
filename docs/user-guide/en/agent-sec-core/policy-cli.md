@@ -86,9 +86,9 @@ The CLI requires the new daemon with carrier support; upgrade the daemon first.
 `agent-sec-cli intent propose` analyzes task intent and outputs an unapproved
 composable Cedar policy candidate for human review of exact paths, directory subtrees,
 actions and conditions. It only outputs a candidate: it does not persist policy-management
-records, bind an execution process, or deploy enforcement. The Policy commands
-below use the existing JSON template format and cannot directly import this Cedar
-candidate.
+records, bind an execution process, or deploy enforcement. After human review, save
+the candidate Cedar text to a file and submit it with `policy create --file` as
+shown below; Policy admission still validates the source and schema.
 
 The LLM receives only the task text and the unified `seccore.cedarschema`,
 and directly returns `{"policy":"...","unresolved":[]}`. Rust parses the
@@ -233,6 +233,170 @@ attribute values.
 This command does not establish these conditions and must not be described as
 blocking `rm`.
 
+### Propose for a single hook command
+
+`agent-sec-cli intent propose-command --command "<command text>" [--cwd <dir>]` serves
+hook integration: it sends only the hook's own `command` and `cwd` and returns the
+unapproved Cedar for that one command. The input is any executable command line, not
+only shell built-ins: `python3 train.py` and `node app.js` are analyzed like
+`rm -rf build`, and only the command text differs.
+The entry point is a `PreToolUse` call from the shell-class tool, whose input carries
+that command line: `run_shell_command`/`shell` in cosh-ng (`sandbox-guard` with matcher
+`^(run_shell_command|shell)$` in `cosh-extension.json`), `Bash` in Qoder and Codex, and
+`run_shell_command` in Qwen Code. Python has no separate tool entry and is submitted
+through it as well. These payloads supply `tool_input.command`; cosh-ng also supplies
+`tool_name` and the session `cwd`, while a host without `cwd` must pass `--cwd`
+explicitly.
+
+For cosh-ng, these are the fields this hook point carries today, and only `command` and
+`cwd` reach the candidate:
+
+| Field | Use |
+|-------|-----|
+| `tool_input.command` | The command text and the only policy source; it carries no argv, environment or `PATH` lookup result |
+| `cwd` | Explains relative paths and is resolved to a canonical absolute path; it is not a permission scope |
+| `tool_name` | Identifies the shell-class tool and is not written to the candidate |
+| `session_id`, `run_id`, `tool_use_id` | Correlate the call for logging and audit |
+| `hook_event_name`, `timestamp`, `transcript_path`, `skill_context` | Protocol fields; cosh-ng's `transcript_path` is a placeholder |
+
+The payload carries no argv, process environment, `PATH` lookup result, absolute
+executable path, redirection target or network endpoint, so the candidate can only
+state what the command literal determines. Obtaining more requires changing the hook
+implementation (parse the command line, read the environment or resolve links in the
+hook and pass new fields); this interface does not fill the gap, and the CLI does not
+infer it locally.
+
+Other `PreToolUse` calls do not apply: `Read`/`Write`/`Edit`/`Grep`/`Glob`/`Skill`/
+`Task`/MCP tools pass structured arguments with no command line and need a separate
+tool-argument-to-permission mapping that this interface does not provide yet but is
+planned; user-prompt, post-tool and session-end hook points carry no command text either.
+If an earlier hook in the same chain rewrote `tool_input.command`, for example a
+sandbox wrapper, pass the original command instead.
+`--cwd` defaults to the CLI process's current working directory and is resolved to a canonical
+absolute path; it explains relative paths and is not a permission scope. The command is never
+executed and no file content is read.
+
+```bash
+agent-sec-cli intent propose-command \
+  --command 'read -r line < report.csv' \
+  --cwd /work
+```
+
+Output is JSON by default because callers parse this stream:
+`{"outcome":"candidate","policy":"Cedar text","caveats":["..."]}` or
+`{"outcome":"needs_clarification","reasons":["..."]}`. `caveats` lists known gaps
+that do not block the candidate, such as an unresolved PATH lookup or unknown script
+behavior, and approval must review them; the array is empty when there are none.
+`--format text` groups the candidate by read/write/exec/spawn/network with `none` for
+absent categories, then lists `Not covered by this candidate`, and falls back to the
+exact Cedar when a condition cannot be summarized. `--format cedar` writes `caveats` as
+`// Not covered:` comments; a clarification prints only comments, so no permit can be
+mistaken for a result. A clarification is returned only when the command itself cannot
+be expressed, never with a partial policy; even a short command carries a policy, and the
+text is empty only when the command has no file, process or network action (`true`, `pwd`,
+`echo`, `date`). An empty policy is a candidate too: it grants nothing, keeps its `caveats`,
+and needs only runtime dependencies to run in the sandbox. The CLI
+re-runs Cedar validation before rendering. Both outcomes exit `0`; an input the daemon
+would reject exits `2` without a request.
+
+The `--format cedar` output is the unapproved candidate text; approval and execution stay
+outside this subcommand. The candidate covers only the command's own demand, so the program,
+cwd and loader paths are not included and a caller must add them explicitly; the CLI adds
+nothing implicitly. The PDP restricts the request to the PAP-managed Cedar policy set:
+`effective = request ∩ PAP policy grants`, with matching forbids taking precedence.
+
+This path does not read or rewrite base policies, does not compute `effective` locally, and
+does not execute the command.
+
+## Intent init: generate Cedar locally from explicit rules
+
+`agent-sec-cli intent init` compiles explicit allow/deny rules into validated
+Cedar on the local host. It needs no daemon, model or network, sends nothing
+off the machine, and never reads the paths it names. Like `intent propose`, it
+only prints an unapproved preview: it does not persist policy-management
+records, bind a process or deploy enforcement.
+
+```bash
+# Deny all network use
+agent-sec-cli intent init --deny-network
+
+# Read the data tree, write only its out subtree, no network
+agent-sec-cli intent init \
+  --allow-read '/data/**' \
+  --allow-write '/data/out/**' \
+  --deny-network
+
+# Read access restricted to one interpreter, with a secrets exception
+agent-sec-cli intent init \
+  --allow-read '/srv/app/**' \
+  --deny-read '/srv/app/secrets/**' \
+  --program /usr/bin/python3
+```
+
+Quote subtree paths in the shell so `*` is passed to the CLI instead of being
+glob-expanded.
+
+Rules can also come from a JSON spec file (`-` reads stdin), which is mutually
+exclusive with the rule flags:
+
+```bash
+agent-sec-cli intent init --spec-file spec.json --format json
+```
+
+```json
+{
+  "allow_read": ["/srv/app/**"],
+  "deny_read": ["/srv/app/secrets/**"],
+  "programs": ["/usr/bin/python3"],
+  "deny_network": true
+}
+```
+
+The spec format is `asc.intent.spec.v1`; omitted fields default to empty or
+false, and unknown fields are rejected. The equivalent flags are `--allow-read`,
+`--allow-write`, `--allow-exec`, `--deny-read`, `--deny-write`, `--deny-exec`
+(each repeatable), `--allow-network` / `--deny-network` (mutually exclusive) and
+`--program` (repeatable).
+
+### Rule semantics
+
+- Paths must be canonical absolute literals; a trailing `/*` or `/**` grants or
+  denies the directory itself and all descendants; the two forms are equivalent.
+  For example, `/data/secrets/**` includes `/data/secrets` but not
+  `/data/secrets-backup`. `/*` and `/**` include `/` and all absolute paths.
+  Other wildcards, relative paths, `..` and backslashes are rejected.
+- Deny rules render as `forbid`, which overrides `permit`. Cedar denies by
+  default without a matching permit, so an allow-only spec already blocks
+  everything it does not name; a deny-only spec adds explicit prohibitions on
+  top of that default.
+- `--program` restricts read/write rules to the listed requesting programs
+  (exact paths). It does not affect `file.exec` rules: the schema records no
+  requesting program for an invocation, whose target executable is already the
+  rule's resource path. A spec with programs but no file rule is rejected.
+- Network control is a whole-network switch (`network.use` on
+  `SecCore::Network::"all"`); the schema has no endpoint granularity.
+- Rendering is deterministic: rules follow a fixed action order and duplicates
+  collapse, so identical specs produce byte-identical output. The result passes
+  the same official Strict validation as the model path.
+
+### Output and errors
+
+`--format cedar` (default) prints the Cedar with a
+`// LOCAL: generated by intent init; not approved, not effective.` header.
+`--format json` prints `asc.intent.init.v1` with the normalized `spec`, the
+validated `policy` text and `schema_sha256`. Paths and programs containing
+control characters, Unicode bidi controls (including U+202E and U+2066–U+2069),
+or Unicode line/paragraph separators are rejected before either format emits
+output. Accepted input uses the same output on terminals and pipes, preserving
+the Cedar template's line breaks. Rejected input is escaped in error messages.
+
+An empty rule set is an error, not an empty deny-all policy. Contradictory
+network switches, invalid paths or programs, more than 1024 rules and spec files
+larger than 256 KiB are rejected before any output. Input and validation errors
+exit `1` with a message naming the offending input; argument conflicts exit `2`;
+success exits `0`. No run installs, records or requests an approval, and the
+output must not be described as blocking actual operations.
+
 ## Manage Policies
 
 Create a JSON template file such as `policy.json`:
@@ -275,12 +439,20 @@ not migrated or automatically rebuilt; clean up old deployments with the compati
 binary before arranging a fresh database.
 
 ```bash
-agent-sec-cli --socket "$SOCKET" policy create --name "protect files" --file policy.json
+agent-sec-cli --socket "$SOCKET" policy create --name "protect files" --language json --file policy.json
 agent-sec-cli --socket "$SOCKET" policy get --policy-id "$POLICY_ID" --revision 1
 agent-sec-cli --socket "$SOCKET" policy list --limit 100 --offset 0
-agent-sec-cli --socket "$SOCKET" policy update --policy-id "$POLICY_ID" --name "protect files v2" --file policy-v2.json
+agent-sec-cli --socket "$SOCKET" policy update --policy-id "$POLICY_ID" --name "protect files v2" --language json --file policy-v2.json
 agent-sec-cli --socket "$SOCKET" policy delete --policy-id "$POLICY_ID" --revision 2
 ```
+
+`--language` selects how `--file` is read: `cedar` (the default) reads raw Cedar
+text, and `json` reads a native template or a JSON source envelope.
+
+**Breaking change:** `policy create` and `policy update` now read `--file` as
+raw Cedar text unless `--language json` is given. Scripts that pass JSON files
+without it are rejected by the daemon with `invalid_argument` and no Policy
+change; add `--language json` to keep their behavior.
 
 Use the ID and revision returned by successful commands. These are reference
 examples, not a sequential script. Create a Scope while the desired Policy revision
@@ -297,8 +469,33 @@ cannot be updated.
 
 ## Cedar Policy source
 
-The same `policy create` and `policy update` commands accept a JSON source
-envelope in `--file`. Save this example as `cedar-policy.json`:
+The same `policy create` and `policy update` commands read a Cedar file
+directly. Save this example as `cedar-policy.cedar`:
+
+```cedar
+forbid(principal, action == SecCore::Action::"file.write", resource)
+when {
+    context.input.operation == SecCore::WriteOperation::"delete" &&
+    resource.path == "/workspace/important"
+};
+```
+
+```bash
+agent-sec-cli --socket "$SOCKET" policy create --name "Cedar protection" --file cedar-policy.cedar
+agent-sec-cli --socket "$SOCKET" policy get --policy-id "$POLICY_ID" --revision 1
+agent-sec-cli --socket "$SOCKET" policy update --policy-id "$POLICY_ID" --name "Cedar protection v2" --schema-revision 1 --file cedar-policy-v2.cedar
+```
+
+The file must be UTF-8 and is stored verbatim. `--schema-id` defaults to
+`seccore.system` and `--schema-revision` to the revision of the schema embedded
+in the CLI; both apply only to `--language cedar`. The resolved reference is
+saved with the Policy, so a later upgrade does not change the schema of an
+existing Policy. `agent-sec-cli policy default` prints the built-in baseline as a
+Cedar file that these commands accept; `policy default --json` prints it as a
+JSON source envelope instead.
+
+A JSON source envelope names the schema inside the file and is imported with
+`--language json`:
 
 ```json
 {
@@ -311,9 +508,7 @@ envelope in `--file`. Save this example as `cedar-policy.json`:
 ```
 
 ```bash
-agent-sec-cli --socket "$SOCKET" policy create --name "Cedar protection" --file cedar-policy.json
-agent-sec-cli --socket "$SOCKET" policy get --policy-id "$POLICY_ID" --revision 1
-agent-sec-cli --socket "$SOCKET" policy update --policy-id "$POLICY_ID" --name "Cedar protection v2" --file cedar-policy-v2.json
+agent-sec-cli --socket "$SOCKET" policy create --name "Cedar protection" --language json --file cedar-policy.json
 ```
 
 Get/list return the saved original text and exact schema reference. Invalid
@@ -322,8 +517,12 @@ changing stored policy content or revisions. Unknown schema revisions are reject
 without fallback. Native templates remain supported in their existing shape.
 
 Policy creation success does not establish target PEP support. The current PEP
-Translator supports a Cedar `forbid` subset for deletion and ordinary-write
-restrictions; unsupported semantics reject the entire translation. Existing
+Translator supports a Cedar `forbid` subset for deletion, ordinary-write
+restrictions and exact-file read denial. Read denial uses `file.read` with an
+exact file path and requires AgentSight's `file_read_protection` capability;
+directory-tree read denial is unsupported. See [AgentSight's read-protection
+boundaries](../agentsight/integrations.md#deny-secret-file-reads).
+Unsupported semantics reject the entire translation. Existing
 Scope/Binding snapshots retain their saved Policy revision and schema when a
 Policy is updated or deleted. Source can be reloaded into an in-memory PST;
 neither AST nor PST is stored in SQLite. An older binary cannot read new Cedar
@@ -333,21 +532,39 @@ use administrator-reviewed policies rather than untrusted generated input.
 
 Sandbox runtime authorization uses the same Policy objects with
 `schema: {schemaId: "seccore.system", revision: 1}`. The OS authorization PDP evaluates
-Agent subjects, `process.spawn` and supported permit advice. Select the baseline and
-optional task Policy IDs in the daemon's authorization configuration, as shown in
-the [sandbox guide](sandbox.md#use-policy-authorization). Each evaluation reads
-their current revisions together. Successful updates affect subsequent requests;
-missing or deleted policies stop new authorization. Existing Scope/Binding
+Agent subjects, `process.spawn` and supported permit advice. Authorization is enabled
+by default, without a separate permission-ceiling configuration. Decisions must be
+accepted within 60 seconds; accepted approval waits and execution may finish later.
+See the [sandbox guide](sandbox.md#use-policy-authorization). Each evaluation reads current
+PAP policies together and includes Cedar sources whose statements all have explicit
+principal headers; no Policy IDs are configured. Use `principal is SecCore::Subject`
+with the optional `agent_type` attribute to match requests. Updates and deletions
+affect subsequent requests; an empty set denies, and read or validation failures stop
+new authorization. Existing Scope/Binding
 snapshots and accepted decisions retain their own bound versions.
 
 ## Manage Scopes
 
 Create an assignment with a Policy ID and exact revision, plus one selector:
 `--process-name` for an exact Linux process name (1–15 bytes), `--executable` for an
-exact normalized absolute executable path, or `--pid` for one process instance.
-Name and path selectors discover existing and future matching processes. PID
-selection pins the first observed instance and never follows PID reuse. Cgroup
-assignments are currently rejected.
+exact normalized absolute executable path, `--cmdline-arg` for an exact normalized
+absolute path that appears as one whole command-line argument, or `--pid` for one
+process instance. Name, executable and command-line selectors discover existing and
+future matching processes. PID selection pins the first observed instance and never
+follows PID reuse. Cgroup assignments are currently rejected.
+
+Use `--cmdline-arg` for script Agents that run under a shared interpreter such as
+node or python, where the process name and executable identify only the interpreter.
+Pass the command path users run, as printed by `which`. A process matches when any
+argument in `/proc/PID/cmdline` equals the path byte for byte. Symbolic links are
+not resolved, and substrings or prefixes do not match. For example, running
+`qodercli` from a shell produces `node /usr/local/bin/qodercli ...`, which
+`--cmdline-arg /usr/local/bin/qodercli` selects. Starting the script by another
+path, such as its resolved `.js` file or a relative path, does not match. Other
+processes of the same user that pass the path as an argument, such as an editor
+opening it, are also selected. Command-line arguments are set by the process, so
+this selector identifies processes within the owner UID; it does not authenticate
+them.
 
 **Breaking change:** `scope create --cgroup-id` has been removed. Cgroup assignments
 were not supported. Scripts that pass this option now fail locally with exit code 2;
@@ -355,6 +572,7 @@ select the intended processes with `--pid`, `--process-name`, or `--executable` 
 
 ```bash
 agent-sec-cli --socket "$SOCKET" scope create --process-name openclaw --policy-id "$POLICY_ID" --policy-revision 1
+agent-sec-cli --socket "$SOCKET" scope create --cmdline-arg "$(which qodercli)" --policy-id "$POLICY_ID" --policy-revision 1
 agent-sec-cli --socket "$SOCKET" scope get --scope-id "$SCOPE_ID"
 agent-sec-cli --socket "$SOCKET" scope list --limit 100 --offset 0
 agent-sec-cli --socket "$SOCKET" scope delete --scope-id "$SCOPE_ID"
@@ -418,12 +636,14 @@ items. Pages may stop early at the 3 MiB encoded item budget.
 | Result | Output | Exit status |
 |--------|--------|-------------|
 | Success | Method result as formatted JSON on stdout; stderr is empty | `0` |
+| Local `policy default` | Raw Cedar on stdout; `--json` selects a JSON source envelope; no daemon request | `0` |
 | Daemon rejection | JSON `{requestId,error:{code,message}}` on stderr; stdout is empty | `1` |
 | File, connection, response or output failure | Error explanation on stderr | `1` |
 | Invalid command-line arguments | Usage error on stderr | `2` |
 
-Template files are limited to 4 MiB and must contain valid JSON without unknown or duplicate
-fields. The complete encoded request and response each have a separate 4 MiB limit, including
+Policy source files are limited to 4 MiB. With `--language json`, they must contain valid
+JSON without unknown or duplicate fields; with `--language cedar`, they must contain
+UTF-8 Cedar text. The complete encoded request and response each have a separate 4 MiB limit, including
 the line delimiter. Passing the file-size check does not guarantee the assembled request fits;
 an oversized request is rejected before sending. The daemon additionally rejects a
 serialized Policy or complete Scope larger than 1 MiB before storing it.

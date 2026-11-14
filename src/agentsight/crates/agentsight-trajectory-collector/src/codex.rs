@@ -288,7 +288,13 @@ pub fn convert_codex_events(
                 }
                 "custom_tool_call" | "function_call" | "local_shell_call" => {
                     let t = ensure_turn(&mut turn, ts, &current_model, &current_effort);
-                    let call = extract_tool_call(payload);
+                    let mut call = extract_tool_call(payload);
+                    if let Some(timestamp) = ts {
+                        call.extra.get_or_insert_with(HashMap::new).insert(
+                            "start_timestamp".into(),
+                            serde_json::Value::String(timestamp.into()),
+                        );
+                    }
                     pending.open_calls.push(call.tool_call_id.clone());
                     t.tool_calls.push(call);
                 }
@@ -313,6 +319,29 @@ pub fn convert_codex_events(
                         subagent_trajectory_ref: None,
                         extra,
                     };
+                    if let Some(timestamp) = ts {
+                        // A user message can flush the issuing turn before the
+                        // result arrives. Timing must follow the same owner.
+                        let call = turn
+                            .as_mut()
+                            .and_then(|t| {
+                                t.tool_calls.iter_mut().find(|c| c.tool_call_id == call_id)
+                            })
+                            .or_else(|| {
+                                steps.iter_mut().rev().find_map(|step| {
+                                    step.tool_calls
+                                        .as_mut()?
+                                        .iter_mut()
+                                        .find(|c| c.tool_call_id == call_id)
+                                })
+                            });
+                        if let Some(call) = call {
+                            call.extra.get_or_insert_with(HashMap::new).insert(
+                                "result_timestamp".into(),
+                                serde_json::Value::String(timestamp.into()),
+                            );
+                        }
+                    }
                     let current_owns_call = turn.as_ref().is_some_and(|t| {
                         t.tool_calls.iter().any(|call| call.tool_call_id == call_id)
                     });

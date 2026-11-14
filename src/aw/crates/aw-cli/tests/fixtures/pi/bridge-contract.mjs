@@ -150,6 +150,38 @@ for (const mode of ["clean", "replace"])
     assert.equal(f.context.result.extra.value, "unchecked");
   });
 
+for (const [mode, expected] of [["clean", "native-after"], ["replace", undefined]])
+  test(`strict ${mode} adopts native structured output without stale fields`, async (t) => {
+    const f = fixture(t, { strict: true, mode });
+    f.context.result.structuredContent = { value: "executed" };
+    f.original.structuredContent = { value: "native-after" };
+    await f.agent.beforeToolCall(f.context);
+    const override = await f.agent.afterToolCall(f.context);
+    const delivered = { ...f.context.result, ...override };
+    await f.agent.processEvents({ type: "tool_execution_end", toolCallId: f.context.toolCall.id,
+      result: delivered });
+    assert.deepEqual(delivered.structuredContent,
+      expected === undefined ? undefined : { value: expected });
+    assert.equal(Object.hasOwn(delivered, "structuredContent"), expected !== undefined);
+  });
+
+test("strict native content override drops executed structured output", async (t) => {
+  const f = fixture(t, { strict: true, mode: "clean" });
+  f.context.result.structuredContent = { value: "executed" };
+  await f.agent.beforeToolCall(f.context);
+  const override = await f.agent.afterToolCall(f.context);
+  assert.equal(Object.hasOwn(override, "structuredContent"), false);
+});
+
+test("report-mode text replacement drops native structured output", async (t) => {
+  const f = fixture(t);
+  f.original.structuredContent = { value: "native-after" };
+  await f.agent.beforeToolCall(f.context);
+  const override = await f.agent.afterToolCall(f.context);
+  assert.equal(override.content[0].text, "compact");
+  assert.equal(Object.hasOwn(override, "structuredContent"), false);
+});
+
 test("strict snapshot errors do not expose the uncloneable value", async (t) => {
   const f = fixture(t, { strict: true, mode: "clean" });
   f.original.details = { callback: function PRIVATE_OUTPUT_SECRET() {} };
@@ -275,4 +307,29 @@ test("non-strict callbacks cannot consume an audited withholding marker", async 
   const f = fixture(t, { mode: "withhold" });
   await f.agent.beforeToolCall(f.context);
   assert.strictEqual(await f.agent.afterToolCall(f.context), f.original);
+});
+
+test("checked input reaches the native permission callback once and retains completion identity", async t => {
+  const directory = mkdtempSync(join(output, "input-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const helper = join(directory, "callback");
+  writeFileSync(helper, `#!/usr/bin/env node
+let input='';for await(const chunk of process.stdin)input+=chunk;
+const p=JSON.parse(input);
+console.log(JSON.stringify(p.event==='tool.before'?{aw_updated_input:{...p.tool_call.input,command:'checked'}}:{}));
+`, { mode: 0o700 });
+  const received = [];
+  const agent = {
+    beforeToolCall: async context => { received.push(structuredClone(context.args)); },
+    afterToolCall: async () => {}, subscribe: () => () => {},
+  };
+  const bridge = installSessionBridge({ agent, sessionManager: { getSessionId: () => 'session' } }, null, {
+    executable: helper, binding: 'unused', ready_path: 'unused', ready_token: 'fixture',
+    hooks: [{ event: 'tool.before', step: 'rewrite', on_error: 'block', budget_ms: 1000, replace_input: true }],
+  });
+  t.after(() => bridge.dispose());
+  const context = { toolCall: { id: 'call', name: 'bash' }, args: { command: 'original', timeout: 7 } };
+  assert.equal(await agent.beforeToolCall(context), undefined);
+  assert.deepEqual(context.args, { command: 'checked', timeout: 7 });
+  assert.deepEqual(received, [{ command: 'checked', timeout: 7 }]);
 });

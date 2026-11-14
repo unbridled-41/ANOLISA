@@ -115,6 +115,10 @@ impl PapRepository for FakeRepository {
         self.inner.get_policy(id, revision)
     }
 
+    fn all_current_policies(&self) -> Result<Vec<PreparedPolicy>, PapError> {
+        self.inner.all_current_policies()
+    }
+
     fn current_policies(&self, ids: &[ResourceId]) -> Result<Vec<PreparedPolicy>, PapError> {
         self.inner.current_policies(ids)
     }
@@ -266,7 +270,11 @@ type Service = PapService<FakeRepository>;
 
 fn service() -> (Service, Arc<FakeRepository>) {
     let repository = Arc::new(FakeRepository::default());
-    (PapService::new(Arc::clone(&repository)), repository)
+    (
+        PapService::new(Arc::clone(&repository))
+            .with_credential_registration(Arc::new(ScopeLifecycle::default())),
+        repository,
+    )
 }
 
 fn policy_template(path: &str) -> PolicySource {
@@ -421,17 +429,16 @@ fn scheduling_failure_write_error_does_not_claim_terminal_state() {
 }
 
 fn credential_template() -> PolicySource {
-    PolicySource::SecCore(
-        serde_json::from_value(serde_json::json!({
-            "specVersion":"0.1", "rules":[{
-                "effect":"allow", "category":"network", "action":"use_credential",
-                "target":{"type":"http_request", "credentialId":"github", "scheme":"https",
-                    "host":"api.github.com", "path":"/repos/**", "methods":["GET"],
-                    "responseRewrite":"buffered"}
-            }]
-        }))
-        .unwrap(),
-    )
+    let root = std::env::temp_dir().join("asc-pap-credential-fixture");
+    PolicySource::Cedar(asc_policy_types::cedar::CedarPolicySource {
+        schema: asc_policy_types::cedar::CedarSchemaReference {
+            schema_id: ResourceId::new(asc_policy_cedar::schema::SCHEMA_ID).unwrap(),
+            revision: Revision::new(asc_policy_cedar::schema::HTTP_SCHEMA_REVISION).unwrap(),
+        },
+        text: include_str!("../../asc-gateway-plan/policies/github.cedar")
+            .replace("/secure/github-real", root.join("real").to_str().unwrap())
+            .replace("/secure/github-fake", root.join("fake").to_str().unwrap()),
+    })
 }
 
 #[derive(Default)]
@@ -443,6 +450,30 @@ struct ScopeLifecycle {
     repository: Mutex<Option<Arc<FakeRepository>>>,
     revoke_gate: Mutex<Option<BoundaryGate>>,
     revoking: AtomicBool,
+    registrations: Mutex<usize>,
+    registration_override: Mutex<Option<Vec<asc_policy_types::policy::CredentialBinding>>>,
+}
+impl asc_pap::CredentialRegistration for ScopeLifecycle {
+    fn register(
+        &self,
+        source: &asc_policy_types::cedar::CedarPolicySource,
+    ) -> Result<Vec<asc_policy_types::policy::CredentialBinding>, PapError> {
+        *self.registrations.lock().unwrap() += 1;
+        if *self.fail.lock().unwrap() == Some("register") {
+            return Err(PapError::Unavailable);
+        }
+        if let Some(bindings) = self.registration_override.lock().unwrap().clone() {
+            return Ok(bindings);
+        }
+        Ok(asc_policy_cedar::credential_rules(source)
+            .unwrap()
+            .into_iter()
+            .map(|rule| asc_policy_types::policy::CredentialBinding {
+                rule_id: rule.rule_id,
+                pair_id: "pair-fixture".into(),
+            })
+            .collect())
+    }
 }
 impl ScopeLifecycle {
     fn call_for_scope(&self, name: &'static str, id: &ResourceId) -> Result<(), PapError> {
@@ -460,7 +491,10 @@ impl ScopeLifecycle {
     }
 
     fn call(&self, name: &'static str) -> Result<(), PapError> {
-        if matches!(name, "validate" | "prepare" | "revoke" | "release") {
+        if matches!(
+            name,
+            "validate" | "prepare" | "restore" | "revoke" | "release"
+        ) {
             assert!(
                 !self.revoking.load(Ordering::SeqCst),
                 "credential lifecycle overlapped a blocked revocation: {name}"
@@ -483,6 +517,9 @@ impl asc_pap::ScopeExecution for ScopeLifecycle {
             assert_eq!(repository.get_scope(&scope.scope_id).unwrap(), *scope);
         }
         self.call_for_scope("prepare", &scope.scope_id)
+    }
+    fn restore(&self, scope: &PreparedScope) -> Result<(), PapError> {
+        self.call_for_scope("restore", &scope.scope_id)
     }
     fn revoke(&self, _: &PreparedScope) -> Result<(), PapError> {
         self.call("revoke")?;
@@ -589,12 +626,80 @@ fn credential_scope_service() -> (
     let lifecycle = Arc::new(ScopeLifecycle::default());
     *lifecycle.repository.lock().unwrap() = Some(repo.clone());
     let pap = pap
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(lifecycle.clone());
     let policy = pap
         .create_policy("credential", &credential_template())
         .unwrap();
     (pap, repo, lifecycle, policy)
+}
+
+#[test]
+fn credential_registration_is_validated_before_policy_commit_and_reused_for_unchanged_source() {
+    let (pap, repo, lifecycle, first) = credential_scope_service();
+    assert!(!first.credential_bindings.is_empty());
+    asc_pap::validate_policy_snapshot(&first).unwrap();
+    assert_eq!(
+        pap.update_policy(&first.policy_id, "credential", &first.template)
+            .unwrap(),
+        first
+    );
+    let renamed = pap
+        .update_policy(&first.policy_id, "renamed", &first.template)
+        .unwrap();
+    assert_eq!(renamed.credential_bindings, first.credential_bindings);
+    assert_eq!(*lifecycle.registrations.lock().unwrap(), 1);
+
+    let mut changed = first.template.clone();
+    let PolicySource::Cedar(source) = &mut changed else {
+        unreachable!()
+    };
+    source
+        .text
+        .push_str("\n// Changed source still requires registration.");
+    *lifecycle.fail.lock().unwrap() = Some("register");
+    for result in [
+        pap.create_policy("new", &changed),
+        pap.update_policy(&first.policy_id, "changed", &changed),
+    ] {
+        assert_eq!(result, Err(PapError::Unavailable));
+    }
+    *lifecycle.fail.lock().unwrap() = None;
+    let mut missing = first.credential_bindings.clone();
+    missing.pop();
+    let mut extra = first.credential_bindings.clone();
+    extra.push(asc_policy_types::policy::CredentialBinding {
+        rule_id: "unrelated".into(),
+        pair_id: "pair-fixture".into(),
+    });
+    let mut duplicate = first.credential_bindings.clone();
+    duplicate[1] = duplicate[0].clone();
+    let mut substituted = first.credential_bindings.clone();
+    substituted[0].rule_id = "unrelated".into();
+    for bindings in [missing, extra, duplicate, substituted] {
+        *lifecycle.registration_override.lock().unwrap() = Some(bindings);
+        for result in [
+            pap.create_policy("invalid", &changed),
+            pap.update_policy(&first.policy_id, "invalid", &changed),
+        ] {
+            assert!(
+                result.is_err(),
+                "incomplete registration must not commit a Policy"
+            );
+        }
+        assert_eq!(
+            repo.list_policies(100, 0).unwrap().items,
+            vec![renamed.clone()]
+        );
+        assert_eq!(
+            repo.get_policy_revision_state(&first.policy_id)
+                .unwrap()
+                .unwrap()
+                .last_allocated_revision,
+            renamed.revision
+        );
+    }
 }
 
 #[test]
@@ -801,7 +906,9 @@ fn credential_admission_validates_before_persistence_and_file_scopes_ignore_exec
         pap.create_scope_assignment(&process_selector(), &refs, Some(1000)),
         Err(PapError::Unavailable)
     );
-    let pap = pap.with_scope_execution(lifecycle.clone());
+    let pap = pap
+        .with_credential_registration(lifecycle.clone())
+        .with_scope_execution(lifecycle.clone());
     *lifecycle.fail.lock().unwrap() = Some("validate");
     assert_eq!(
         pap.create_scope_assignment(&process_selector(), &refs, Some(1000)),
@@ -851,6 +958,7 @@ fn credential_failures_compensate_in_order_and_retry_retains_zero_instance_respo
         let (pap, repo) = service();
         let lifecycle = Arc::new(ScopeLifecycle::default());
         let pap = pap
+            .with_credential_registration(lifecycle.clone())
             .with_scope_execution(lifecycle.clone())
             .with_scope_discovery(lifecycle.clone());
         let policy = pap
@@ -920,6 +1028,7 @@ fn failed_start_and_revocation_keep_zero_binding_scope_for_durable_sweep() {
     let lifecycle = Arc::new(ScopeLifecycle::default());
     *lifecycle.fail.lock().unwrap() = Some("revoke");
     let pap = pap
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(Arc::new(FailingStart(lifecycle.clone())));
     let policy = pap
@@ -954,6 +1063,7 @@ fn recovery_prepares_pinned_active_scope_and_resumes_failed_deletion() {
     let (pap, repo) = service();
     let lifecycle = Arc::new(ScopeLifecycle::default());
     let pap = pap
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(lifecycle.clone());
     let policy = pap
@@ -965,13 +1075,16 @@ fn recovery_prepares_pinned_active_scope_and_resumes_failed_deletion() {
     pap.delete_policy_revision(&policy.policy_id, policy.revision)
         .unwrap();
     let recovered = PapService::new(repo.clone())
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(lifecycle.clone());
     lifecycle.calls.lock().unwrap().clear();
+    *lifecycle.fail.lock().unwrap() = Some("register");
     recovered.recover_scopes().unwrap();
+    assert_eq!(*lifecycle.registrations.lock().unwrap(), 1);
     assert_eq!(
         *lifecycle.calls.lock().unwrap(),
-        ["validate", "prepare", "start"]
+        ["validate", "restore", "start"]
     );
     assert_eq!(recovered.get_scope(&scope.scope_id).unwrap(), scope);
     *lifecycle.fail.lock().unwrap() = Some("revoke");
@@ -982,6 +1095,7 @@ fn recovery_prepares_pinned_active_scope_and_resumes_failed_deletion() {
     *lifecycle.fail.lock().unwrap() = None;
     lifecycle.calls.lock().unwrap().clear();
     let recovered = PapService::new(repo)
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(lifecycle.clone());
     recovered.recover_scopes().unwrap();
@@ -998,11 +1112,12 @@ fn recovery_prepares_pinned_active_scope_and_resumes_failed_deletion() {
 #[test]
 fn active_recovery_failure_preserves_authority_and_explicit_retry_restores_before_bindings() {
     use asc_pap::ScopeBindingSink;
-    for failing in ["validate", "prepare", "start"] {
+    for failing in ["validate", "restore", "start"] {
         let (pap, repo) = service();
         let lifecycle = Arc::new(ScopeLifecycle::default());
         *lifecycle.repository.lock().unwrap() = Some(repo.clone());
         let pap = pap
+            .with_credential_registration(lifecycle.clone())
             .with_scope_execution(lifecycle.clone())
             .with_scope_discovery(lifecycle.clone());
         let policy = pap
@@ -1028,6 +1143,7 @@ fn active_recovery_failure_preserves_authority_and_explicit_retry_restores_befor
         pap.delete_policy_revision(&policy.policy_id, policy.revision)
             .unwrap();
         let recovered = PapService::new(repo.clone())
+            .with_credential_registration(lifecycle.clone())
             .with_scope_execution(lifecycle.clone())
             .with_scope_discovery(lifecycle.clone());
         *lifecycle.fail.lock().unwrap() = Some(failing);
@@ -1039,24 +1155,26 @@ fn active_recovery_failure_preserves_authority_and_explicit_retry_restores_befor
         assert_eq!(repo.binding_state(&binding.spec.binding_id), failed_binding);
         let failed_calls = match failing {
             "validate" => vec!["validate"],
-            "prepare" => vec!["validate", "prepare"],
-            "start" => vec!["validate", "prepare", "start"],
+            "restore" => vec!["validate", "restore"],
+            "start" => vec!["validate", "restore", "start"],
             _ => unreachable!(),
         };
         let mut expected = failed_calls.clone();
-        expected.extend(["validate", "prepare", "start"]);
+        expected.extend(["validate", "restore", "start"]);
         assert_eq!(*lifecycle.calls.lock().unwrap(), expected);
         assert_eq!(
             lifecycle.seeds.lock().unwrap().last(),
             Some(&repo.scope_discovery_seed(&healthy.scope_id).unwrap())
         );
 
+        // Explicit retry remains strict admission, so it uses prepare.
+        *lifecycle.fail.lock().unwrap() = Some("prepare");
         lifecycle.calls.lock().unwrap().clear();
         assert_eq!(
             recovered.retry_scope(&scope.scope_id),
             Err(PapError::Unavailable)
         );
-        assert_eq!(*lifecycle.calls.lock().unwrap(), failed_calls);
+        assert_eq!(*lifecycle.calls.lock().unwrap(), ["validate", "prepare"]);
         assert_eq!(repo.binding_state(&binding.spec.binding_id), failed_binding);
         assert_eq!(recovered.get_scope(&scope.scope_id).unwrap(), *scope);
 
@@ -1113,6 +1231,7 @@ fn deleting_credential_scope_survives_last_binding_cleanup_until_durable_executi
     let (pap, repo) = service();
     let lifecycle = Arc::new(ScopeLifecycle::default());
     let pap = pap
+        .with_credential_registration(lifecycle.clone())
         .with_scope_execution(lifecycle.clone())
         .with_scope_discovery(lifecycle.clone());
     let policy = pap
@@ -1218,6 +1337,44 @@ fn assignment_snapshots_survive_policy_update_delete_and_later_discovery() {
     assert!(wire.get("policyTemplates").is_none());
     assert_eq!(wire["policySnapshots"], serde_json::json!([original]));
     assert_eq!(repo.list_policies(10, 0).unwrap().total, 0);
+}
+
+#[test]
+fn request_policy_resolution_does_not_rewrite_existing_scope_or_binding() {
+    use asc_pap::ScopeBindingSink;
+    let (pap, _) = service();
+    let pap = pap.with_scope_discovery(Arc::new(Discovery));
+    let original = pap
+        .create_policy("deployment", &policy_template("/a"))
+        .unwrap();
+    let scope = assignment(&pap, &original);
+    let instance = serde_json::from_str::<PreparedBinding>(COMPLETE_BINDING)
+        .unwrap()
+        .scope
+        .process;
+    pap.sync_instances(&scope.scope_id, std::slice::from_ref(&instance))
+        .unwrap();
+    let before = pap.list_bindings(10, 0).unwrap();
+    let explicit = serde_json::from_value(serde_json::json!({
+        "language":"cedar", "content":{
+            "schema":{"schemaId":"seccore.system","revision":1},
+            "text":"permit(principal is SecCore::Subject, action == SecCore::Action::\"process.spawn\", resource);"
+        }
+    })).unwrap();
+    let current = pap
+        .update_policy(&original.policy_id, "request policy", &explicit)
+        .unwrap();
+    assert_eq!(
+        pap.authorization_policies().unwrap().policies[0].revision,
+        current.revision
+    );
+    assert_eq!(pap.get_scope(&scope.scope_id).unwrap(), scope);
+    assert_eq!(pap.list_bindings(10, 0).unwrap(), before);
+    pap.delete_policy_revision(&current.policy_id, current.revision)
+        .unwrap();
+    assert!(pap.authorization_policies().unwrap().policies.is_empty());
+    assert_eq!(pap.get_scope(&scope.scope_id).unwrap(), scope);
+    assert_eq!(pap.list_bindings(10, 0).unwrap(), before);
 }
 
 #[test]

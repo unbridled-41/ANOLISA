@@ -95,7 +95,7 @@ pub fn extract_response_content(
     if let Some(choices) = resp.get("choices").and_then(|c| c.as_array()) {
         for choice in choices {
             // Support both "message" (standard response) and "delta" (SSE streaming) formats
-            let msg_or_delta = choice.get("message").or_else(|| choice.get("delta"));
+            let msg_or_delta = message_or_delta(choice);
 
             if let Some(msg) = msg_or_delta {
                 // Extract content
@@ -425,19 +425,32 @@ pub fn extract_response_content(
             // delivered them, and counting both would double the call.
             "response.output_item.added" => {
                 if let Some(item) = resp.get("item") {
-                    // A custom (freeform) tool is announced the same way as a
-                    // function call; only the kind differs. The message parser
-                    // and the chatml reader both accept it, so a captured
-                    // turn that called one must count its name here too.
-                    if matches!(
-                        item.get("type").and_then(|t| t.as_str()),
-                        Some("function_call" | "custom_tool_call")
-                    ) {
-                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                            if !name.is_empty() {
-                                return Some((String::new(), None, vec![format!("{name}: ")]));
+                    match item.get("type").and_then(|t| t.as_str()) {
+                        // A custom (freeform) tool is announced the same way as a
+                        // function call; only the kind differs. The message parser
+                        // and the chatml reader both accept it, so a captured
+                        // turn that called one must count its name here too.
+                        Some("function_call" | "custom_tool_call") => {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                if !name.is_empty() {
+                                    return Some((String::new(), None, vec![format!("{name}: ")]));
+                                }
                             }
                         }
+                        // Codex's `local_shell_call` names the tool implicitly
+                        // and carries the whole argv in `action`. The live
+                        // message parser and the collector already read it, so
+                        // a shell-only turn must not count zero output tokens.
+                        Some("local_shell_call") => {
+                            if let Some(action) = item.get("action") {
+                                return Some((
+                                    String::new(),
+                                    None,
+                                    vec![format!("shell: {action}")],
+                                ));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -786,6 +799,20 @@ fn is_closing_response_event(chunk: &Value) -> bool {
     )
 }
 
+/// Returns the message or delta object of a choice, treating an explicit
+/// `"message": null` as absent.
+///
+/// Some OpenAI-compatible gateways include `"message": null` next to a
+/// streaming `delta`. Preferring the present-but-null value hid the delta's
+/// content, refusal, reasoning and tool calls from the manual counter and the
+/// drain estimate.
+fn message_or_delta(choice: &Value) -> Option<&Value> {
+    choice
+        .get("message")
+        .filter(|value| !value.is_null())
+        .or_else(|| choice.get("delta").filter(|value| !value.is_null()))
+}
+
 /// A choice that carries `message` instead of `delta` speaks in cumulative
 /// snapshots: each frame repeats the answer so far rather than an increment.
 fn carries_message_snapshot(chunk: &Value) -> bool {
@@ -804,9 +831,12 @@ fn carries_message_snapshot(chunk: &Value) -> bool {
         .get("choices")
         .and_then(|c| c.as_array())
         .is_some_and(|choices| {
-            choices
-                .iter()
-                .any(|choice| choice.get("message").is_some() && choice.get("delta").is_none())
+            choices.iter().any(|choice| {
+                choice
+                    .get("message")
+                    .is_some_and(|message| !message.is_null())
+                    && choice.get("delta").is_none_or(Value::is_null)
+            })
         })
 }
 
@@ -857,7 +887,7 @@ pub(crate) fn merge_response_tool_calls(chunks: &[Value]) -> Vec<String> {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or(choice_pos as u64);
-                let snapshot = choice.get("message");
+                let snapshot = choice.get("message").filter(|message| !message.is_null());
                 let message = snapshot.or_else(|| choice.get("delta"));
                 let Some(message) = message else {
                     continue;
@@ -1012,7 +1042,7 @@ fn collect_native_call_slots(chunk: &Value, slots: &mut std::collections::BTreeM
         .iter()
         .enumerate()
     {
-        let message = choice.get("message").or_else(|| choice.get("delta"));
+        let message = message_or_delta(choice);
         let Some(message) = message else {
             continue;
         };
@@ -1518,6 +1548,61 @@ mod tests {
         assert!(tool_calls.is_empty());
     }
 
+    /// A gateway may emit `"message": null` alongside a streaming `delta`.
+    /// Treating the null value as a present message hid the delta's content
+    /// and tool calls from the manual counters and the drain estimate, while
+    /// the live message parser kept them.
+    #[test]
+    fn test_null_message_does_not_hide_delta() {
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "message": null, "delta": {"content": "hello there"}}]
+        });
+        let (content, reasoning, tool_calls) =
+            extract_response_content(Some(&chunk)).expect("the delta content must be extracted");
+        assert_eq!(content, "hello there");
+        assert!(reasoning.is_none());
+        assert!(tool_calls.is_empty());
+
+        let tool_chunk = serde_json::json!({
+            "choices": [{"index": 0, "message": null, "delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "lookup", "arguments": "{}"}}
+            ]}}]
+        });
+        let (_, _, tool_calls) = extract_response_content(Some(&tool_chunk))
+            .expect("the delta tool call must be extracted");
+        assert_eq!(tool_calls, vec!["lookup: {}".to_string()]);
+        assert_eq!(
+            merge_response_tool_calls(&[tool_chunk]),
+            vec!["lookup: {}".to_string()]
+        );
+
+        assert_eq!(
+            merge_response_output_text(&[chunk]).0,
+            "hello there",
+            "a null message must not turn a delta chunk into a snapshot"
+        );
+    }
+
+    /// The mirror case: a gateway repeats a whole `message` frame beside
+    /// `"delta": null`. A present-but-null delta must count as absent, or the
+    /// cumulative snapshots are appended as increments and the answer is
+    /// counted twice.
+    #[test]
+    fn test_null_delta_does_not_hide_message_snapshot() {
+        let first = serde_json::json!({
+            "choices": [{"index": 0, "message": {"content": "hello"}, "delta": null}]
+        });
+        let second = serde_json::json!({
+            "choices": [{"index": 0, "message": {"content": "hello world"}, "delta": null}]
+        });
+        assert!(carries_message_snapshot(&first));
+        assert_eq!(
+            merge_response_output_text(&[first, second]).0,
+            "hello world",
+            "a cumulative snapshot repeated beside a null delta must not be appended"
+        );
+    }
+
     /// An OpenAI-compatible gateway's final frame can be a whole `message`
     /// after a run of deltas; the snapshot completes the text instead of
     /// appending to it.
@@ -1927,6 +2012,45 @@ mod tests {
         );
         let (_, _, fragments) = merge_response_output_text(&[whole]);
         assert_eq!(fragments.concat(), "get_weather: {\"city\":\"Beijing\"}");
+    }
+
+    /// Codex's Responses protocol announces a shell call as
+    /// `local_shell_call`, with the argv in `action` and the tool name
+    /// implicit. The live message parser and the collector already read that
+    /// shape, but the manual counter and drain estimate counted a shell-only
+    /// turn as zero output tokens.
+    #[test]
+    fn test_responses_api_local_shell_call_yields_a_tool_call() {
+        let added = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "local_shell_call",
+                "id": "lsc_1",
+                "call_id": "call_shell",
+                "action": {"type": "exec", "command": ["ls", "-l"]},
+            },
+        });
+        let (content, reasoning, tool_calls) =
+            extract_response_content(Some(&added)).expect("the shell call must be extracted");
+        assert_eq!(content, "");
+        assert!(reasoning.is_none());
+        assert_eq!(
+            tool_calls,
+            vec![format!(
+                "shell: {}",
+                serde_json::json!({"type": "exec", "command": ["ls", "-l"]})
+            )]
+        );
+
+        let (_, _, merged) = merge_response_output_text(&[added]);
+        assert_eq!(
+            merged,
+            vec![format!(
+                "shell: {}",
+                serde_json::json!({"type": "exec", "command": ["ls", "-l"]})
+            )]
+        );
     }
 
     /// A custom (freeform) tool call is announced and streamed exactly like a

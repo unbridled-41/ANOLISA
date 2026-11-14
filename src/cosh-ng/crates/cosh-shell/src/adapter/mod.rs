@@ -17,6 +17,7 @@ mod control_protocol;
 mod control_protocol_tests;
 mod cosh_core;
 mod cosh_core_auth;
+pub(crate) use cosh_core_auth::StartupAuthHint;
 mod cosh_core_process;
 mod cosh_core_registry;
 #[cfg(test)]
@@ -211,6 +212,18 @@ impl AgentRunHandle {
             pending_provider_session: None,
             cancellation_artifacts: ProviderCancellationArtifactStore::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_events(events: Vec<AgentEvent>) -> Self {
+        let (approval_sender, _approval_receiver) = mpsc::channel();
+        let mut handle = Self::test_with_approval_sender(approval_sender);
+        let (sender, receiver) = mpsc::channel();
+        for event in events {
+            sender.send(Ok(event)).expect("seed test event");
+        }
+        handle.receiver = receiver;
+        handle
     }
 
     #[cfg(test)]
