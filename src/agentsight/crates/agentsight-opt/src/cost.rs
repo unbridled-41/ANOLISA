@@ -1045,18 +1045,45 @@ fn normalize_cmd(cmd: &str) -> String {
     trunc(&masked.join(" "), 60)
 }
 
+fn command_for_action_sig(args: &serde_json::Value) -> Option<String> {
+    for key in ["command", "cmd", "script"] {
+        if let Some(parts) = args.get(key).and_then(|v| v.as_array()) {
+            if let [shell, flag, script] = parts.as_slice() {
+                let is_shell = shell
+                    .as_str()
+                    .and_then(|s| std::path::Path::new(s).file_name())
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| matches!(s, "sh" | "bash" | "zsh"));
+                if is_shell && flag.as_str().is_some_and(|f| matches!(f, "-c" | "-lc")) {
+                    if let Some(text) = script.as_str().filter(|s| !s.trim().is_empty()) {
+                        return Some(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    crate::tool_command::from_arguments(args)
+}
+
 /// Stable action signature for one tool call —— the axis along which the LLM
 /// sees a pitfall recur. Normalization is what makes non-adjacent recurrence
 /// visible; comparing raw command strings only catches back-to-back spinning.
 pub(crate) fn normalize_action_sig(call: &crate::atif::AtifToolCall) -> String {
     let tool = call.display_name();
     let args = &call.arguments;
-    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-        return format!("{tool}:{}", normalize_cmd(cmd));
+    if let Some(cmd) = command_for_action_sig(args) {
+        return format!("{tool}:{}", normalize_cmd(&cmd));
     }
-    let target = ["file_path", "path", "notebook_path", "pattern", "url"]
-        .iter()
-        .find_map(|k| args.get(k).and_then(|v| v.as_str()));
+    let target = [
+        "file_path",
+        "filePath",
+        "path",
+        "notebook_path",
+        "pattern",
+        "url",
+    ]
+    .iter()
+    .find_map(|k| args.get(k).and_then(|v| v.as_str()));
     match target {
         Some(t) => format!("{tool}:{}", trunc(&mask_digits(t), 60)),
         None => tool,
@@ -2024,6 +2051,78 @@ mod tests {
     fn action_sig_uses_file_target_for_write_tools() {
         let sig = normalize_action_sig(&call("Edit", json!({"file_path": "src/p.rs"})));
         assert_eq!(sig, "Edit:src/p.rs");
+        let camel = normalize_action_sig(&call("Edit", json!({"filePath": "src/q.rs"})));
+        assert_eq!(camel, "Edit:src/q.rs");
+    }
+
+    #[test]
+    fn action_sig_preserves_cmd_script_and_argv_commands_without_false_repeats() {
+        // Distinct Codex/Qoder `cmd`, `script`, argv `command: [...]`, and
+        // `bash -lc "cd /repo && ..."` calls must not collapse into bare tool
+        // names or fabricate "重复动作签名存在" in detour facts.
+        assert_ne!(
+            normalize_action_sig(&call("exec_command", json!({"cmd": "cargo test"}))),
+            normalize_action_sig(&call("exec_command", json!({"cmd": "cargo build"})))
+        );
+        assert_ne!(
+            normalize_action_sig(&call("run_script", json!({"script": "pytest tests/a.py"}))),
+            normalize_action_sig(&call("run_script", json!({"script": "ruff check src"})))
+        );
+        assert_ne!(
+            normalize_action_sig(&call("shell", json!({"command": ["cargo", "test"]}))),
+            normalize_action_sig(&call("shell", json!({"command": ["cargo", "build"]})))
+        );
+        assert_eq!(
+            normalize_action_sig(&call(
+                "shell",
+                json!({"command": ["bash", "-lc", "cd /repo && cargo test"]})
+            )),
+            "shell:cargo test"
+        );
+        assert_eq!(
+            normalize_action_sig(&call(
+                "shell",
+                json!({"command": ["bash", "-lc", "cd /repo && cargo build"]})
+            )),
+            "shell:cargo build"
+        );
+
+        let distinct_codex_turns = traj(
+            r#"[
+            {"step_id":1,"source":"user","timestamp":"2026-07-02T06:30:00Z","message":"build and test"},
+            {"step_id":2,"source":"agent","timestamp":"2026-07-02T06:30:01Z",
+             "tool_calls":[{"tool_call_id":"c1","function_name":"exec_command","arguments":{"cmd":"cargo check"}}],
+             "observation":{"results":[{"source_call_id":"c1","content":"ok"}]},
+             "metrics":{"prompt_tokens":100,"completion_tokens":20}},
+            {"step_id":3,"source":"agent","timestamp":"2026-07-02T06:30:02Z",
+             "tool_calls":[{"tool_call_id":"c2","function_name":"exec_command","arguments":{"cmd":"cargo test"}}],
+             "observation":{"results":[{"source_call_id":"c2","content":"ok"}]},
+             "metrics":{"prompt_tokens":120,"completion_tokens":20}},
+            {"step_id":4,"source":"agent","timestamp":"2026-07-02T06:30:03Z",
+             "tool_calls":[{"tool_call_id":"c3","function_name":"shell","arguments":{"command":["git","status"]}}],
+             "observation":{"results":[{"source_call_id":"c3","content":"clean"}]},
+             "metrics":{"prompt_tokens":140,"completion_tokens":20}},
+            {"step_id":5,"source":"agent","timestamp":"2026-07-02T06:30:04Z",
+             "tool_calls":[{"tool_call_id":"c4","function_name":"shell","arguments":{"command":["git","diff"]}}],
+             "observation":{"results":[{"source_call_id":"c4","content":""}]},
+             "metrics":{"prompt_tokens":160,"completion_tokens":20}},
+            {"step_id":6,"source":"agent","timestamp":"2026-07-02T06:30:05Z",
+             "tool_calls":[{"tool_call_id":"c5","function_name":"Edit","arguments":{"filePath":"src/a.rs"}}],
+             "observation":{"results":[{"source_call_id":"c5","content":"ok"}]},
+             "metrics":{"prompt_tokens":180,"completion_tokens":20}},
+            {"step_id":7,"source":"agent","timestamp":"2026-07-02T06:30:06Z",
+             "tool_calls":[{"tool_call_id":"c6","function_name":"Edit","arguments":{"filePath":"src/b.rs"}}],
+             "observation":{"results":[{"source_call_id":"c6","content":"ok"}]},
+             "metrics":{"prompt_tokens":200,"completion_tokens":20}}
+        ]"#,
+        );
+        let set = extract_waste_candidates(&distinct_codex_turns).unwrap();
+        let detour = set.candidates.iter().find(|c| c.id == "detour").unwrap();
+        assert!(
+            detour.facts.contains("重复动作签名无"),
+            "distinct cmd/argv/filePath actions must not report repeated signatures: {}",
+            detour.facts
+        );
     }
 
     /// The ledger must cover every agent turn (no filtering), carry the canonical
